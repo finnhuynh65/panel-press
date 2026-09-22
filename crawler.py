@@ -24,7 +24,7 @@ from urllib.request import Request, urlopen
 
 
 DEFAULT_SERIES = "https://weebcentral.com/series/01J76XYBR7JHFW7Q80MHJP5VYW/Fire-Punch"
-USER_AGENT = "ComicCrawler/1.0 (+respectful, rate-limited downloader)"
+USER_AGENT = "PanelPress/1.0 (+respectful, rate-limited downloader)"
 
 
 class PageParser(HTMLParser):
@@ -64,6 +64,9 @@ class Chapter:
 
 
 def fetch(url: str, *, retries: int = 3, delay: float = 0.0) -> bytes:
+    scheme = urlparse(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise RuntimeError(f"Unsupported URL scheme for {url!r}: only http and https are allowed")
     if delay:
         time.sleep(delay)
     request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,image/*,*/*;q=0.8"})
@@ -122,8 +125,8 @@ def discover_chapters(series_url: str, delay: float, locator: dict[str, object] 
     title = re.sub(r"<[^>]+>", "", series_title.group(1)).strip() if series_title else "series"
 
     # Older pages exposed a full-chapter-list endpoint. Newer pages can render
-    # the complete list directly, so parse both and tolerate an empty endpoint.
-    chapter_pages = [series_html]
+    # the complete list directly, so prefer the endpoint when it yields
+    # chapters and fall back to the series landing page otherwise.
     locator = locator or {}
     href_pattern = str(locator.get("chapter_href_pattern") or r"/chapters/")
     number_pattern = str(locator.get("chapter_number_pattern") or DEFAULT_CHAPTER_NUMBER_PATTERN)
@@ -132,17 +135,14 @@ def discover_chapters(series_url: str, delay: float, locator: dict[str, object] 
     except re.error:
         href_re = re.compile(r"/chapters/", re.I)
     endpoint_match = re.search(r'hx-get="([^"]+/full-chapter-list)"', series_html)
-    full_list_url = urljoin(series_url, endpoint_match.group(1) if endpoint_match else "full-chapter-list")
-    try:
-        chapter_pages.insert(0, fetch(full_list_url, delay=delay).decode("utf-8", "replace"))
-    except RuntimeError:
-        pass
+    series_base = series_url.rstrip("/") + "/"
+    full_list_url = urljoin(series_base, endpoint_match.group(1) if endpoint_match else "full-chapter-list")
 
-    chapters: dict[str, Chapter] = {}
-    for chapter_page in chapter_pages:
-        parser = PageParser()
-        parser.feed(chapter_page)
-        for href, label in parser.links:
+    def parse_chapter_page(markup: str) -> dict[str, Chapter]:
+        page_parser = PageParser()
+        page_parser.feed(markup)
+        found: dict[str, Chapter] = {}
+        for href, label in page_parser.links:
             if not href_re.search(href):
                 continue
             number = parse_chapter_number(label, number_pattern)
@@ -151,7 +151,16 @@ def discover_chapters(series_url: str, delay: float, locator: dict[str, object] 
             label = clean_chapter_label(label)
             url = urljoin(base, href)
             chapter_id = url.rstrip("/").split("/")[-1]
-            chapters[chapter_id] = Chapter(number, label, url, chapter_id)
+            found[chapter_id] = Chapter(number, label, url, chapter_id)
+        return found
+
+    chapters: dict[str, Chapter] = {}
+    try:
+        chapters = parse_chapter_page(fetch(full_list_url, delay=delay).decode("utf-8", "replace"))
+    except RuntimeError:
+        chapters = {}
+    if not chapters:
+        chapters = parse_chapter_page(series_html)
     return title, sorted(chapters.values(), key=lambda c: number_key(c.number))
 
 
@@ -166,7 +175,10 @@ def discover_pages(chapter: Chapter, delay: float, locator: dict[str, object] | 
 
 
 def safe_name(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._") or "untitled"
+    cleaned = re.sub(r"[^\w.\- ]+", "_", str(value), flags=re.UNICODE)
+    cleaned = re.sub(r"\s+", "_", cleaned).strip("._")
+    cleaned = re.sub(r"_{2,}", "_", cleaned)
+    return cleaned or "untitled"
 
 
 def write_json(path: Path, value: object) -> None:

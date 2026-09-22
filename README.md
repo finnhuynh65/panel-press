@@ -1,4 +1,4 @@
-# Comic Crawler
+# Panel Press
 
 Small, resumable crawler for a manga series. It discovers the complete chapter list, preserves chapter order, writes metadata, and optionally downloads page images into one folder per chapter.
 
@@ -103,7 +103,10 @@ KCC's native device identifiers when KCC is installed.
 The local picker supports a whole directory as well as individual files. For
 example, choosing `output/Fire_Punch` imports every supported image beneath
 the folder, orders them by relative path, and ignores `series.json`,
-`chapters.json`, and `chapter.json` metadata files.
+`chapters.json`, and `chapter.json` as pages. The source URL recorded in
+`series.json` is reused to infer reading direction; direction itself is not
+stored in the metadata, so a local folder from an unrecognized host defaults
+to left-to-right unless chosen explicitly.
 
 For a native KCC run, those relative directories are preserved in the staged
 source passed to `kcc-c2e`; KCC can use each chapter directory as an ebook

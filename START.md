@@ -6,7 +6,7 @@
 2. Move into the repository:
 
 ```bash
-cd "/Users/finn/Desktop/Comic Crawler"
+cd "/Users/finn/Desktop/panel press"
 ```
 
 3. Make the launcher executable once:
@@ -48,7 +48,7 @@ python --version
 2. Double-click `start.bat`, or run it from Command Prompt:
 
 ```bat
-cd /d "C:\path\to\Comic Crawler"
+cd /d "C:\path\to\panel press"
 start.bat
 ```
 

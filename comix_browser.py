@@ -22,7 +22,10 @@ CHROME_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 
 
 
 def safe_name(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._") or "untitled"
+    cleaned = re.sub(r"[^\w.\- ]+", "_", str(value), flags=re.UNICODE)
+    cleaned = re.sub(r"\s+", "_", cleaned).strip("._")
+    cleaned = re.sub(r"_{2,}", "_", cleaned)
+    return cleaned or "untitled"
 
 
 def write_json(path: Path, value: object) -> None:

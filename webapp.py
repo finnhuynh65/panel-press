@@ -20,7 +20,8 @@ import tempfile
 import threading
 import uuid
 import zipfile
-import cgi
+from email import policy as email_policy
+from email.parser import BytesParser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,6 +36,7 @@ EXPORTS = OUTPUT / "exports"
 JOBS: dict[str, dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
 DOWNLOAD_WORKERS = 4
+MAX_JOBS = 50
 
 PROFILES = {
     # Device identifiers and target sizes mirror KCC's built-in profiles.
@@ -71,7 +73,7 @@ INDEX_HTML = r'''<!doctype html>
 </style></head><body><main>
 <div class="top"><div class="brand"><div class="mark">▤</div><div><div class="eyebrow">Local web converter</div><h1>Panel Press</h1><p>From web page to reader-ready file.</p></div></div><div class="pill">Kindle · Kobo · CBZ</div></div>
 <section class="hero"><div class="eyebrow">Your reading shelf, rebuilt</div><h2>Turn a chapter link into a <em>clean comic file.</em></h2><p>Paste a series URL, choose the pages you want, and package them for your e-reader. The parser is source-agnostic and can be tuned for other sites.</p></section>
-<div class="grid"><section class="card"><h3>1 · Find your source</h3><div class="field"><label for="url">Series or chapter URL</label><input class="input" id="url" value="https://weebcentral.com/series/01J76XYBR7JHFW7Q80MHJP5VYW/Fire-Punch" placeholder="https://example.com/series/..." type="url"><div class="hint">The default adapter understands WeebCentral. Generic sites use visible chapter links and page images.</div></div><div class="field"><label for="files">Or import local images / PDF / folder</label><input class="input" id="files" type="file" multiple webkitdirectory directory accept=".pdf,.jpg,.jpeg,.png,.webp,.gif,.json"><div class="hint">Choose individual files or a crawler folder such as <code>output/crawled/Fire_Punch</code>. Crawler metadata preserves source and reading direction.</div></div><div class="row"><div class="field"><label for="title">Book name</label><input class="input" id="title" placeholder="Uses the source title if blank" type="text"><div class="hint">Used for the combined file and as the prefix for batch files.</div></div><div class="field"><label for="profile">Reader profile</label><select id="profile"><option value="kindle-paperwhite">Kindle Paperwhite · 1072×1448</option><option value="kindle-scribe">Kindle Scribe · 1860×2480</option><option value="kobo-clara">Kobo Clara · 1072×1448</option><option value="kobo-libra">Kobo Libra · 1264×1680</option><option value="original">Original dimensions</option></select></div></div><div class="row"><div class="field"><label for="format">Output format</label><select id="format"><option value="auto">Auto · use profile</option><option value="mobi">MOBI · requires KindleGen</option><option value="epub">EPUB · Send to Kindle / Kobo</option><option value="kepub">KEPUB · Kobo</option><option value="cbz">CBZ · archive</option><option value="pdf">PDF · fixed pages</option></select></div><div class="field"><label for="quality">Image quality</label><select id="quality"><option value="balanced">Balanced · KCC optimized</option><option value="best">Best quality · larger file</option><option value="compact">Compact · smaller file</option></select></div></div><div class="row"><div class="field"><label for="packaging">Packaging</label><select id="packaging"><option value="combined">One file · chapter navigation</option><option value="separate">Separate file per chapter</option></select></div><div class="field"><label for="direction">Reading direction</label><select id="direction"><option value="auto">Auto · detect from source</option><option value="ltr">Left to right</option><option value="rtl">Right to left · manga</option></select><div class="hint">Auto uses manga defaults for known manga sources and keeps webtoons left-to-right.</div></div></div><div class="row"><div class="field"><label for="webtoon">Processing mode</label><select id="webtoon"><option value="false">Manga / comic pages</option><option value="true">Webtoon · long strips</option></select></div><div class="field"><label for="divider">Chapter divider</label><select id="divider"><option value="false">No divider page</option><option value="true">Add divider before each chapter</option></select></div></div><div class="actions"><button class="button primary" id="scan">Scan chapters</button><span class="status" id="scanStatus"></span></div></section>
+<div class="grid"><section class="card"><h3>1 · Find your source</h3><div class="field"><label for="url">Series or chapter URL</label><input class="input" id="url" value="https://weebcentral.com/series/01J76XYBR7JHFW7Q80MHJP5VYW/Fire-Punch" placeholder="https://example.com/series/..." type="url"><div class="hint">The default adapter understands WeebCentral. Generic sites use visible chapter links and page images.</div></div><div class="field"><label for="files">Or import local images / PDF / folder</label><input class="input" id="files" type="file" multiple webkitdirectory directory accept=".pdf,.jpg,.jpeg,.png,.webp,.gif,.json"><div class="hint">Choose individual files or a crawler folder such as <code>output/crawled/Fire_Punch</code>. Crawler metadata preserves the source URL used to infer reading direction.</div></div><div class="row"><div class="field"><label for="title">Book name</label><input class="input" id="title" placeholder="Uses the source title if blank" type="text"><div class="hint">Used for the combined file and as the prefix for batch files.</div></div><div class="field"><label for="profile">Reader profile</label><select id="profile"><option value="kindle-paperwhite">Kindle Paperwhite · 1072×1448</option><option value="kindle-scribe">Kindle Scribe · 1860×2480</option><option value="kobo-clara">Kobo Clara · 1072×1448</option><option value="kobo-libra">Kobo Libra · 1264×1680</option><option value="original">Original dimensions</option></select></div></div><div class="row"><div class="field"><label for="format">Output format</label><select id="format"><option value="auto">Auto · use profile</option><option value="mobi">MOBI · requires KindleGen</option><option value="epub">EPUB · Send to Kindle / Kobo</option><option value="kepub">KEPUB · Kobo</option><option value="cbz">CBZ · archive</option><option value="pdf">PDF · fixed pages</option></select></div><div class="field"><label for="quality">Image quality</label><select id="quality"><option value="balanced">Balanced · KCC optimized</option><option value="best">Best quality · larger file</option><option value="compact">Compact · smaller file</option></select></div></div><div class="row"><div class="field"><label for="packaging">Packaging</label><select id="packaging"><option value="combined">One file · chapter navigation</option><option value="separate">Separate file per chapter</option></select></div><div class="field"><label for="direction">Reading direction</label><select id="direction"><option value="auto">Auto · detect from source</option><option value="ltr">Left to right</option><option value="rtl">Right to left · manga</option></select><div class="hint">Auto uses manga defaults for known manga sources and keeps webtoons left-to-right.</div></div></div><div class="row"><div class="field"><label for="webtoon">Processing mode</label><select id="webtoon"><option value="false">Manga / comic pages</option><option value="true">Webtoon · long strips</option></select></div><div class="field"><label for="divider">Chapter divider</label><select id="divider"><option value="false">No divider page</option><option value="true">Add divider before each chapter</option></select></div></div><div class="actions"><button class="button primary" id="scan">Scan chapters</button><span class="status" id="scanStatus"></span></div></section>
 <section class="card"><h3>2 · Select & package</h3><div id="chapterList" class="empty">Scan a link or choose local files.</div><div class="actions"><button class="button secondary" id="all" disabled>Select all</button><button class="button primary" id="convert" disabled>Build reader file</button></div><div class="hint">KCC uses MOBI for Kindle only when KindleGen is available; otherwise it creates fixed-layout EPUB for Send to Kindle. Kobo profiles produce KEPUB/EPUB. A compatible CBZ/EPUB fallback is available if KCC dependencies are missing.</div></section></div>
 <section class="card" style="margin-top:20px"><h3>Activity</h3><div class="log" id="log">Ready. Downloads happen on this machine, so the browser never needs direct access to the source site.</div><div class="footer">Use only material you are authorized to download. Based on the ordered-image, device-profile, and webtoon workflow documented by <a href="https://github.com/ciromattia/kcc" target="_blank">KCC</a>.</div></section>
 </main><script>
@@ -592,7 +594,7 @@ def rename_outputs(files: list[Path], output_root: Path, title: str, source: Pat
 MANGA_SOURCE_HOSTS = {'weebcentral.com'}
 
 
-def resolve_direction(requested: str, source_url: str = '', title: str = '', webtoon: bool = False) -> str:
+def resolve_direction(requested: str, source_url: str = '', webtoon: bool = False) -> str:
     """Resolve safe reading direction while keeping explicit choices authoritative."""
     requested = requested.lower().strip()
     if requested in {'ltr', 'rtl'}:
@@ -616,17 +618,34 @@ def request_delay(value: object, default: float = 1.0) -> float:
         return default
 
 
+def resolve_title(*candidates: object) -> str:
+    """Pick the first non-empty candidate name, sanitized, else 'Comic'."""
+    for candidate in candidates:
+        text = str(candidate).strip() if candidate is not None else ''
+        if text:
+            return safe_name(text)
+    return 'Comic'
+
+
 def update_job(job_id: str, message: str) -> None:
     with JOBS_LOCK:
         if job_id in JOBS:
             JOBS[job_id].update({'status': 'working', 'message': message})
 
 
+def prune_jobs() -> None:
+    with JOBS_LOCK:
+        while len(JOBS) > MAX_JOBS:
+            JOBS.pop(next(iter(JOBS)), None)
+
+
 def download_to_path(url: str, target: Path, delay: float) -> Path:
     if target.exists() and target.stat().st_size > 0:
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(fetch(url, delay=delay))
+    temporary = target.with_suffix(target.suffix + '.part')
+    temporary.write_bytes(fetch(url, delay=delay))
+    temporary.replace(target)
     return target
 
 
@@ -651,13 +670,14 @@ def convert_job(job_id: str, payload: dict[str, object]) -> None:
     try:
         folder_mode=str(payload.get('folder_mode','combined')); save_source=str(payload.get('save_source','false')).lower()=='true' if isinstance(payload.get('save_source'),str) else bool(payload.get('save_source',False))
         profile=PROFILES.get(str(payload.get('profile')),PROFILES['original']); delay=request_delay(payload.get('delay')); webtoon=str(payload.get('webtoon',False)).lower()=='true' if isinstance(payload.get('webtoon'),str) else bool(payload.get('webtoon',False)); direction=str(payload.get('direction','auto')); requested_format=str(payload.get('format','auto')); packaging=str(payload.get('packaging','combined')); quality=str(payload.get('quality','balanced')); divider=str(payload.get('divider',False)).lower()=='true' if isinstance(payload.get('divider'),str) else bool(payload.get('divider',False)); author=str(payload.get('author') or '').strip(); export_name=safe_name(str(payload.get('export_name') or '').strip()) if str(payload.get('export_name') or '').strip() else ''
-        selected=payload.get('chapters',[]); requested_title=safe_name(str(payload.get('title') or '')); title='Comic'; source_url=''; temp=Path(tempfile.mkdtemp(prefix='panel-press-')); source=temp/'source'; all_pages=[]; source_archive=None
+        selected=payload.get('chapters',[]); requested_title=str(payload.get('title') or '').strip(); title='Comic'; source_url=''; temp=Path(tempfile.mkdtemp(prefix='panel-press-')); source=temp/'source'; all_pages=[]; source_archive=None
         if payload.get('files'):
             paths=[Path(p) for p in payload['files']]
             relative_paths=payload.get('relative_paths')
             relative_paths=relative_paths if isinstance(relative_paths,list) else None
             metadata=uploaded_metadata(paths,relative_paths)
-            title=requested_title or safe_name(str(metadata.get('title') or paths[0].stem))
+            first_name=re.sub(r'^\d{6}-', '', paths[0].name)
+            title=resolve_title(requested_title, metadata.get('title'), Path(first_name).stem)
             source_url=str(metadata.get('source') or '')
             if len(paths)==1 and paths[0].suffix.lower()=='.pdf' and find_kcc() and profile.get('kcc'):
                 source=paths[0]
@@ -667,8 +687,8 @@ def convert_job(job_id: str, payload: dict[str, object]) -> None:
             url=str(payload['url']); source_url=url; locator=payload.get('locator') if isinstance(payload.get('locator'),dict) else None
             # The browser already scanned the series. Reuse the selected rows
             # instead of fetching and parsing the entire series a second time.
-            discovered_title=Path(urlparse(url).path.rstrip('/')).name or 'Comic'
-            title=requested_title or safe_name(discovered_title); source.mkdir(parents=True,exist_ok=True)
+            discovered_title=Path(urlparse(url).path.rstrip('/')).name
+            title=resolve_title(requested_title, discovered_title); source.mkdir(parents=True,exist_ok=True)
             update_job(job_id, f'Preparing {len(selected)} selected chapter(s)…')
             page_jobs=[]
             for ci,row in enumerate(selected,1):
@@ -685,14 +705,19 @@ def convert_job(job_id: str, payload: dict[str, object]) -> None:
                     future.result(); completed+=1
                     if completed==total_pages or completed%5==0:
                         update_job(job_id, f'Downloading {completed}/{total_pages} pages…')
-            all_pages=sorted((p for p in source.rglob('*') if p.is_file()),key=natural_sort_key)
+            all_pages=sorted((p for p in source.rglob('*') if p.is_file() and p.suffix.lower() in {'.jpg','.jpeg','.png','.webp','.gif'}),key=natural_sort_key)
             if not all_pages: raise RuntimeError('No pages were found in the selected chapters.')
+        if not all_pages:
+            if source.is_dir():
+                all_pages=sorted((p for p in source.rglob('*') if p.is_file() and p.suffix.lower() in {'.jpg','.jpeg','.png','.webp','.gif'}),key=natural_sort_key)
+            elif source.is_file():
+                all_pages=[source]
         if save_source:
             saved_source=save_source_folder(source,title)
             if saved_source:
                 source_archive=saved_source[1]
                 update_job(job_id, f'Saved source images to output/crawled/{saved_source[0].name}/…')
-        direction=resolve_direction(direction, source_url, title, webtoon)
+        direction=resolve_direction(direction, source_url, webtoon)
         kcc_input=kcc_source_root(source)
         export_root,output_dir,chapter_output_dir=export_paths(title)
         separate_folders=folder_mode=='separate' and not payload.get('files') and kcc_input.is_dir()
@@ -749,6 +774,17 @@ def _has_pillow() -> bool:
         return False
 
 
+def multipart_parts(request_file: Path):
+    """Yield (field_name, filename, payload_bytes) for a stored multipart body."""
+    with request_file.open('rb') as handle:
+        message=BytesParser(policy=email_policy.default).parse(handle)
+    for part in message.iter_parts():
+        name=part.get_param('name', header='content-disposition')
+        filename=part.get_filename()
+        data=part.get_payload(decode=True) or b''
+        yield name, filename, data
+
+
 class Handler(BaseHTTPRequestHandler):
     def send_json(self, data, status=200):
         raw=json.dumps(data).encode(); self.send_response(status); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw)
@@ -764,24 +800,37 @@ class Handler(BaseHTTPRequestHandler):
             path=(OUTPUT/self.path.split('/')[-1]).resolve(); candidates=list(OUTPUT.rglob(path.name))
             if candidates and candidates[0].is_file(): path=candidates[0]; raw=path.read_bytes(); self.send_response(200); self.send_header('Content-Type',mimetypes.guess_type(str(path))[0] or 'application/octet-stream'); self.send_header('Content-Disposition',f'attachment; filename="{path.name}"'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
         self.send_error(404)
+    def stream_body(self, length, content_type, upload_dir):
+        """Write synthesized headers plus the request body to disk incrementally."""
+        request_file=upload_dir/'.request-body'
+        with request_file.open('wb') as handle:
+            handle.write(b'Content-Type: '+content_type.encode('latin-1')+b'\r\nMIME-Version: 1.0\r\n\r\n')
+            remaining=length
+            while remaining > 0:
+                chunk=self.rfile.read(min(65536, remaining))
+                if not chunk: break
+                handle.write(chunk); remaining-=len(chunk)
+        return request_file
+
     def do_POST(self):
-        length=int(self.headers.get('Content-Length','0')); content_type=self.headers.get('Content-Type',''); raw=self.rfile.read(length)
-        payload={}
+        length=int(self.headers.get('Content-Length','0')); content_type=self.headers.get('Content-Type','')
         if content_type.startswith('multipart/form-data'):
-            form=cgi.FieldStorage(fp=__import__('io').BytesIO(raw),headers=self.headers,environ={'REQUEST_METHOD':'POST','CONTENT_TYPE':content_type,'CONTENT_LENGTH':str(length)})
             upload_dir=Path(tempfile.mkdtemp(prefix='panel-upload-')); paths=[]
             fields={'profile':'original','delay':'1','webtoon':'false','direction':'auto','title':'Comic','author':'','export_name':'','relative_paths':'[]','format':'auto','packaging':'combined','quality':'balanced','divider':'false','chapter_href_pattern':'','chapter_number_pattern':'','page_list_suffix':'','save_source':'false'}
-            for key in fields:
-                if key in form: fields[key]=form.getfirst(key)
-            items=form['files'] if 'files' in form and isinstance(form['files'],list) else ([form['files']] if 'files' in form else [])
-            for item_index,item in enumerate(items,1):
-                name=safe_name(Path(item.filename or 'upload').name)
-                path=upload_dir/f'{item_index:06d}-{name}'
-                path.write_bytes(item.file.read()); paths.append(str(path))
+            request_file=self.stream_body(length, content_type, upload_dir)
+            file_index=0
+            for name, filename, data in multipart_parts(request_file):
+                if filename is not None and name == 'files':
+                    file_index+=1
+                    target=upload_dir/f'{file_index:06d}-{safe_name(Path(filename).name)}'
+                    target.write_bytes(data); paths.append(str(target))
+                elif name in fields:
+                    fields[name]=data.decode('utf-8','replace')
             payload={**fields,'files':paths,'webtoon':fields['webtoon']=='true','locator':{key:fields[key] for key in ('chapter_href_pattern','chapter_number_pattern','page_list_suffix') if fields[key].strip()},'_upload_dir':str(upload_dir)}
             try: payload['relative_paths']=json.loads(fields['relative_paths'])
             except json.JSONDecodeError: payload['relative_paths']=[]
         else:
+            raw=self.rfile.read(length) if length else b''
             payload=json.loads(raw or b'{}')
         try:
             if self.path in {'/api/v1/scans','/api/scan'}:
@@ -789,6 +838,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path in {'/api/v1/conversions','/api/convert'}:
                 job_id=uuid.uuid4().hex; with_lock={'status':'working','message':'Queued…'}
                 with JOBS_LOCK: JOBS[job_id]=with_lock
+                prune_jobs()
                 threading.Thread(target=convert_job,args=(job_id,payload),daemon=True).start(); self.send_json({'job_id':job_id}); return
             self.send_error(404)
         except Exception as exc: self.send_json({'error':str(exc)},400)

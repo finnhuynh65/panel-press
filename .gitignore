@@ -36,8 +36,7 @@ htmlcov/
 *.sqlite3
 
 # Generated crawler and conversion output
-output/*
-!output/.gitkeep
+output/
 
 # Temporary files and archives created during local processing
 tmp/
@@ -49,3 +48,6 @@ temp/
 build/
 dist/
 *.spec.bak
+
+# OpenSpec planning artifacts
+openspec/
