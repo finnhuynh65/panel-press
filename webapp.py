@@ -21,11 +21,12 @@ import threading
 import uuid
 import zipfile
 import cgi
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-from crawler import Chapter, discover_chapters, discover_pages, fetch, guess_extension, safe_name
+from crawler import Chapter, clean_chapter_label, discover_chapters, discover_pages, fetch, guess_extension, safe_name
 
 
 ROOT = Path(__file__).resolve().parent
@@ -33,6 +34,7 @@ OUTPUT = ROOT / "output"
 EXPORTS = OUTPUT / "exports"
 JOBS: dict[str, dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
+DOWNLOAD_WORKERS = 4
 
 PROFILES = {
     # Device identifiers and target sizes mirror KCC's built-in profiles.
@@ -73,11 +75,20 @@ INDEX_HTML = r'''<!doctype html>
 <section class="card"><h3>2 · Select & package</h3><div id="chapterList" class="empty">Scan a link or choose local files.</div><div class="actions"><button class="button secondary" id="all" disabled>Select all</button><button class="button primary" id="convert" disabled>Build reader file</button></div><div class="hint">KCC uses MOBI for Kindle only when KindleGen is available; otherwise it creates fixed-layout EPUB for Send to Kindle. Kobo profiles produce KEPUB/EPUB. A compatible CBZ/EPUB fallback is available if KCC dependencies are missing.</div></section></div>
 <section class="card" style="margin-top:20px"><h3>Activity</h3><div class="log" id="log">Ready. Downloads happen on this machine, so the browser never needs direct access to the source site.</div><div class="footer">Use only material you are authorized to download. Based on the ordered-image, device-profile, and webtoon workflow documented by <a href="https://github.com/ciromattia/kcc" target="_blank">KCC</a>.</div></section>
 </main><script>
-let chapters=[];const $=id=>document.getElementById(id);const read=(id,fallback='')=>{const el=$(id);return el?el.value:fallback};const selectedFiles=()=>Array.from($('files')?.files||[]);function log(t){const el=$('log');if(el)el.textContent=t}
+let chapters=[],scannedTitle='';const $=id=>document.getElementById(id);const read=(id,fallback='')=>{const el=$(id);return el?el.value:fallback};const selectedFiles=()=>Array.from($('files')?.files||[]);function log(t){const el=$('log');if(el)el.textContent=t}
 function updateCompatibility(capabilities={}){const profile=read('profile');const format=$('format');const kepub=format?.querySelector('option[value="kepub"]');const mobi=format?.querySelector('option[value="mobi"]');if(kepub){kepub.disabled=!profile.startsWith('kobo');if(kepub.disabled&&format.value==='kepub')format.value='auto'}if(mobi){mobi.disabled=capabilities.kindlegen===false;mobi.textContent=capabilities.kindlegen?'MOBI · requires KindleGen':'MOBI · unavailable (KindleGen missing)'}const direction=$('direction');if(direction){direction.disabled=read('webtoon')==='true';if(direction.disabled)direction.value='auto'}const divider=$('divider');if(divider){divider.disabled=read('packaging')==='separate';if(divider.disabled)divider.value='false'}}
 ['profile','format','packaging','webtoon'].forEach(id=>$(id)?.addEventListener('change',()=>updateCompatibility()));fetch('/api/capabilities').then(r=>r.json()).then(updateCompatibility).catch(()=>updateCompatibility());updateCompatibility();
+function explainDisabledFormats(){const profile=read('profile');const kepub=$('format')?.querySelector('option[value="kepub"]');const mobi=$('format')?.querySelector('option[value="mobi"]');if(kepub)kepub.title=kepub.disabled?'Choose a Kobo profile to enable KEPUB.':'';if(mobi)mobi.title=mobi.disabled?'Install KindleGen or choose EPUB/CBZ/PDF instead.':''}['profile','format'].forEach(id=>$(id)?.addEventListener('change',explainDisabledFormats));explainDisabledFormats();
 // Start with an empty source field; users choose the series URL explicitly.
 $('url').value='';
+function readLocator(){return {chapter_href_pattern:read('chapter_href_pattern'),chapter_number_pattern:read('chapter_number_pattern'),page_list_suffix:read('page_list_suffix')}}
+function readChapterRange(){const from=Number.parseFloat(read('chapter_from'));const to=Number.parseFloat(read('chapter_to'));return {from:Number.isFinite(from)?from:null,to:Number.isFinite(to)?to:null}}
+function chapterInRange(chapter){const range=readChapterRange();const number=Number.parseFloat(chapter.number);return !Number.isFinite(number)||(range.from===null||number>=range.from)&&(range.to===null||number<=range.to)}
+function addLocatorFields(){const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent='Advanced source locator (optional)';details.append(summary);const hint=document.createElement('div');hint.className='hint';hint.textContent='Use regular expressions only for unusual sites. Leave blank for automatic detection. Example number pattern: Chapter\\s+(\\d+)';details.append(hint);const fields=[['chapter_href_pattern','Chapter link pattern','/chapters/'],['chapter_number_pattern','Chapter number pattern','Chapter\\s+(\\d+)'],['page_list_suffix','Page-list URL suffix','/images?is_prev=False']];for(const [id,labelText,placeholder] of fields){const field=document.createElement('div');field.className='field';const label=document.createElement('label');label.htmlFor=id;label.textContent=labelText;const input=document.createElement('input');input.className='input';input.id=id;input.type='text';input.placeholder=placeholder;field.append(label,input);details.append(field)}$('url')?.parentElement?.after(details)}
+addLocatorFields();
+function addChapterRangeFields(){const row=document.createElement('div');row.className='row';const fields=[['chapter_from','From chapter','1'],['chapter_to','To chapter','e.g. 10']];for(const [id,labelText,placeholder] of fields){const field=document.createElement('div');field.className='field';const label=document.createElement('label');label.htmlFor=id;label.textContent=labelText;const input=document.createElement('input');input.className='input';input.id=id;input.type='number';input.min='0';input.step='any';input.placeholder=placeholder;field.append(label,input);row.append(field)}const hint=document.createElement('div');hint.className='hint';hint.textContent='Optional: only chapters in this inclusive range will be selected for download.';row.append(hint);$('url')?.parentElement?.after(row);const saveField=document.createElement('div');saveField.className='field';const saveLabel=document.createElement('label');saveLabel.htmlFor='save_source';saveLabel.textContent='Source image folder';const save=document.createElement('select');save.id='save_source';save.innerHTML='<option value="false">Do not keep source images</option><option value="true">Keep folder + downloadable ZIP</option>';const saveHint=document.createElement('div');saveHint.className='hint';saveHint.textContent='By default, source images are temporary and removed after conversion.';saveField.append(saveLabel,save,saveHint);$('url')?.parentElement?.after(saveField);['chapter_from','chapter_to'].forEach(id=>$(id)?.addEventListener('input',()=>{if(chapters.length)render()}))}
+addChapterRangeFields();
+$('files')?.nextElementSibling?.replaceChildren(document.createTextNode('Choose images, one PDF, multiple PDFs, or a crawler folder. Multiple PDFs become ordered chapters using their filenames.'));
 function addExportFields(){const row=document.createElement('div');row.className='row';const make=(id,label,placeholder)=>{const field=document.createElement('div');field.className='field';const labelNode=document.createElement('label');labelNode.textContent=label;labelNode.htmlFor=id;const input=document.createElement('input');input.className='input';input.id=id;input.placeholder=placeholder;input.type='text';field.append(labelNode,input);return field};row.append(make('author','Author','Optional author name'),make('export_name','Export filename','Uses book name if blank'));$('title')?.parentElement?.parentElement?.after(row)}addExportFields();
 setTimeout(()=>{const previousFetch=window.fetch;window.fetch=(url,options={})=>{if(url==='/api/v1/conversions'&&options.body){if(options.body instanceof FormData){options.body.append('author',read('author'));options.body.append('export_name',read('export_name'))}else{const data=JSON.parse(options.body);data.author=read('author');data.export_name=read('export_name');options.body=JSON.stringify(data)}}return previousFetch(url,options)}},0);
 // Keep the profile picker aligned with the device profiles supported by KCC.
@@ -86,16 +97,18 @@ const readerProfiles=[
 ];$('profile').innerHTML=readerProfiles.map(([value,label])=>`<option value="${value}">${label}</option>`).join('');
 const folderMode=document.createElement('select');folderMode.id='folder_mode';folderMode.innerHTML='<option value="combined">One folder for this job</option><option value="separate">Separate folder for each link</option>';const folderLabel=document.createElement('label');folderLabel.textContent='Download folders';folderLabel.htmlFor='folder_mode';const folderField=document.createElement('div');folderField.className='field';folderField.append(folderLabel,folderMode);const packagingField=$('packaging');if(packagingField?.parentElement?.parentElement)packagingField.parentElement.parentElement.appendChild(folderField);
 const nativeFetch=window.fetch;window.fetch=(url,options={})=>{if(url==='/api/v1/conversions'&&options.body){if(options.body instanceof FormData){options.body.append('folder_mode',folderMode.value)}else{const data=JSON.parse(options.body);data.folder_mode=folderMode.value;options.body=JSON.stringify(data)}}return nativeFetch(url,options)};
+const locatorFetch=window.fetch;window.fetch=(url,options={})=>{if(options.body&&(url==='/api/v1/scans'||url==='/api/v1/conversions')){if(options.body instanceof FormData){const locator=readLocator();for(const [key,value] of Object.entries(locator))options.body.append(key,value)}else{const data=JSON.parse(options.body);data.locator=readLocator();options.body=JSON.stringify(data)}}return locatorFetch(url,options)};
+const sourceFetch=window.fetch;window.fetch=(url,options={})=>{if(url==='/api/v1/conversions'&&options.body){if(options.body instanceof FormData)options.body.append('save_source',read('save_source','false'));else{const data=JSON.parse(options.body);data.save_source=read('save_source','false');options.body=JSON.stringify(data)}}return sourceFetch(url,options)};
 $('files').onchange=()=>{if($('files').files.length){chapters=[];const images=[...$('files').files].filter(f=>/\.(jpe?g|png|webp|gif|pdf)$/i.test(f.name));$('chapterList').className='empty';$('chapterList').textContent=images.length+' image/PDF file(s) ready. Build the reader file to continue.';$('all').disabled=true;$('convert').disabled=images.length===0;$('scanStatus').textContent='Local import selected'}};
-$('scan').onclick=async()=>{const url=read('url').trim();if(!url)return; $('scan').disabled=true;$('scanStatus').textContent='Fetching metadata…';log('Scanning '+url+'\nRespecting the configured request delay.');try{const r=await fetch('/api/v1/scans',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url,delay:Number(read('delay','1'))})});const d=await r.json();if(!r.ok)throw Error(d.error);chapters=d.chapters||[];render();$('scanStatus').textContent=d.title+' · '+chapters.length+' chapters';log('Found '+chapters.length+' chapters in “'+d.title+'”. Select what you want to package.')}catch(e){$('scanStatus').textContent='Scan failed';log('Error: '+e.message)}finally{$('scan').disabled=false}}
-function render(){const box=$('chapterList');if(!chapters.length){box.className='empty';box.textContent='No chapters found. Try a site-specific URL or adjust its parser settings.';return}box.className='chapters';box.innerHTML=chapters.map((c,i)=>`<label class="chapter"><input type="checkbox" data-i="${i}" checked><span><strong>${c.title||'Chapter '+c.number}</strong><small>${c.number?'Chapter '+c.number+' · ':''}${c.url}</small></span></label>`).join('');$('all').disabled=false;$('convert').disabled=false}
-$('all').onclick=()=>document.querySelectorAll('.chapter input').forEach(x=>x.checked=true);
+$('scan').onclick=async()=>{const url=read('url').trim();if(!url)return; $('scan').disabled=true;$('scanStatus').textContent='Fetching metadata…';log('Scanning '+url+'\nRespecting the configured request delay.');try{const r=await fetch('/api/v1/scans',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url,delay:Number(read('delay','1'))})});const d=await r.json();if(!r.ok)throw Error(d.error);scannedTitle=d.title||'';chapters=d.chapters||[];render();$('scanStatus').textContent=d.title+' · '+chapters.length+' chapters';log('Found '+chapters.length+' chapters in “'+d.title+'”. Select what you want to package.')}catch(e){$('scanStatus').textContent='Scan failed';log('Error: '+e.message)}finally{$('scan').disabled=false}}
+function render(){const box=$('chapterList');if(!chapters.length){box.className='empty';box.textContent='No chapters found automatically. Open “Advanced source locator” above and enter a pattern, then scan again. Example: Chapter\\s+(\\d+)';const details=document.querySelector('details');if(details)details.open=true;$('all').disabled=true;$('convert').disabled=true;return}const range=readChapterRange();const selectedCount=chapters.filter(chapterInRange).length;box.className='chapters';box.innerHTML=chapters.map((c,i)=>`<label class="chapter"><input type="checkbox" data-i="${i}" ${chapterInRange(c)?'checked':''}><span><strong>${c.title||'Chapter '+c.number}</strong><small>${c.number?'Chapter '+c.number+' · ':''}${c.url}</small></span></label>`).join('');$('all').disabled=false;$('all').textContent=range.from!==null||range.to!==null?'Select all in range':'Select all';$('convert').disabled=selectedCount===0;$('scanStatus').textContent=$('scanStatus').textContent.replace(/ · selected \d+ chapters$/,'')+(range.from!==null||range.to!==null?' · selected '+selectedCount+' chapters':'')}
+$('all').onclick=()=>document.querySelectorAll('.chapter input').forEach((x,i)=>x.checked=chapterInRange(chapters[i]));
 $('convert').onclick=async()=>{const selected=[...document.querySelectorAll('.chapter input:checked')].map(x=>chapters[Number(x.dataset.i)]);if(!selected.length && !selectedFiles().length)return; $('convert').disabled=true;log('Starting download and packaging…');try{let body,headers={};if(selectedFiles().length){body=new FormData();const files=[...selectedFiles()].filter(f=>/\.(jpe?g|png|webp|gif|pdf|json)$/i.test(f.name)).sort((a,b)=>(a.webkitRelativePath||a.name).localeCompare(b.webkitRelativePath||b.name,undefined,{numeric:true,sensitivity:'base'}));for(const file of files)body.append('files',file);body.append('relative_paths',JSON.stringify(files.map(file=>file.webkitRelativePath||file.name)));body.append('title',read('title')||files[0]?.webkitRelativePath?.split('/')[0]||files[0]?.name?.replace(/\.[^.]+$/,'')||'Comic');body.append('profile',read('profile'));body.append('format',read('format'));body.append('quality',read('quality'));body.append('packaging',read('packaging'));body.append('divider',read('divider'));body.append('delay',read('delay'));body.append('webtoon',read('webtoon'));body.append('direction',read('direction'))}else{headers={'content-type':'application/json'};body=JSON.stringify({url:read('url'),title:read('title'),profile:read('profile'),format:read('format'),quality:read('quality'),packaging:read('packaging'),divider:read('divider'),delay:Number(read('delay')),webtoon:read('webtoon')==='true',direction:read('direction'),chapters:selected})}const r=await fetch('/api/v1/conversions',{method:'POST',headers,body});const d=await r.json();if(!r.ok)throw Error(d.error);poll(d.job_id)}catch(e){log('Error: '+e.message);$('convert').disabled=false}}
 async function poll(id){const r=await fetch('/api/v1/conversions/'+id),d=await r.json();log(d.message||'Working…');if(d.status==='done'){log(d.message+'\n\nDownload: '+d.files.join(', '));$('convert').disabled=false;return}if(d.status==='error'){$('convert').disabled=false;return}setTimeout(()=>poll(d.job_id||id),900)}
 </script></body></html>'''
 
 
-def generic_discover(series_url: str, delay: float) -> tuple[str, list[Chapter]]:
+def generic_discover(series_url: str, delay: float, locator: dict[str, object] | None = None) -> tuple[str, list[Chapter]]:
     """Fallback parser for sites with conventional chapter links."""
     from html.parser import HTMLParser
 
@@ -110,22 +123,29 @@ def generic_discover(series_url: str, delay: float) -> tuple[str, list[Chapter]]
         def handle_endtag(self, tag):
             if self.href == '__title__': self.title=' '.join(''.join(self.text).split()); self.href=None
             elif tag == 'a' and self.href: self.rows.append((self.href,' '.join(''.join(self.text).split()))); self.href=None
+    locator = locator or {}
+    href_pattern = str(locator.get('chapter_href_pattern') or r'(chapter|episode|volume|ch[- _]?[0-9])')
+    number_pattern = str(locator.get('chapter_number_pattern') or r'(?:chapter|ch|episode|ep|volume|vol|meeting)[^0-9]*([0-9]+(?:[.][0-9]+)?)')
+    try: href_re=re.compile(href_pattern,re.I)
+    except re.error: href_re=re.compile(r'(chapter|episode|volume|ch[- _]?[0-9])',re.I)
+    try: number_re=re.compile(number_pattern,re.I)
+    except re.error: number_re=re.compile(r'(?:chapter|ch|episode|ep|volume|vol|meeting)[^0-9]*([0-9]+(?:[.][0-9]+)?)',re.I)
     parser=Links(); parser.feed(fetch(series_url, delay=delay).decode('utf-8','replace'))
     rows=[]; seen=set()
     for href,label in parser.rows:
-        if not re.search(r'(chapter|episode|volume|ch[- _]?[0-9])', label+' '+href, re.I): continue
+        if not href_re.search(label+' '+href): continue
         url=urljoin(series_url,href)
         if url in seen: continue
-        seen.add(url); m=re.search(r'(?:chapter|episode|ch)[^0-9]*([0-9]+(?:[.][0-9]+)?)',label+' '+href,re.I)
+        seen.add(url); m=number_re.search(label+' '+href)
         number=m.group(1) if m else str(len(rows)+1)
-        rows.append(Chapter(number,label or 'Chapter '+number,url,url.rstrip('/').split('/')[-1]))
+        rows.append(Chapter(number,clean_chapter_label(label or 'Chapter '+number),url,url.rstrip('/').split('/')[-1]))
     return parser.title or Path(urlparse(series_url).path).name or 'Comic', rows
 
 
-def scan(url: str, delay: float):
+def scan(url: str, delay: float, locator: dict[str, object] | None = None):
     if 'weebcentral.com' in urlparse(url).netloc:
-        return discover_chapters(url, delay)
-    return generic_discover(url, delay)
+        return discover_chapters(url, delay, locator)
+    return generic_discover(url, delay, locator)
 
 
 def generic_discover_pages(chapter: Chapter, delay: float) -> list[str]:
@@ -143,9 +163,9 @@ def generic_discover_pages(chapter: Chapter, delay: float) -> list[str]:
     return list(dict.fromkeys(parser.urls))
 
 
-def chapter_pages(chapter: Chapter, delay: float) -> list[str]:
+def chapter_pages(chapter: Chapter, delay: float, locator: dict[str, object] | None = None) -> list[str]:
     if 'weebcentral.com' in urlparse(chapter.url).netloc:
-        return discover_pages(chapter, delay)
+        return discover_pages(chapter, delay, locator)
     return generic_discover_pages(chapter, delay)
 
 
@@ -283,8 +303,20 @@ def prepare_local_import(paths: list[Path], target: Path, relative_paths: list[s
     pdfs=[p for p in paths if p.suffix.lower()=='.pdf']
     if pdfs:
         media=[p for p in paths if p.suffix.lower() in {'.pdf','.jpg','.jpeg','.png','.webp','.gif'}]
-        if len(pdfs)>1 or len(media)>1: raise RuntimeError('Use one PDF at a time, or import images without a PDF.')
-        extract_pdf(pdfs[0],target)
+        if len(media) != len(pdfs): raise RuntimeError('PDF files cannot be mixed with image files. Upload PDFs together or upload images separately.')
+        if len(pdfs)==1:
+            extract_pdf(pdfs[0],target)
+            return
+        # Multiple PDFs become ordered chapter folders based on their upload
+        # paths/names, so the existing KCC chapter and batch packaging logic
+        # can process them without merging page streams out of order.
+        indexed=list(enumerate(pdfs))
+        indexed.sort(key=lambda item: volume_sort_key(relative_paths[item[0]] if relative_paths and item[0] < len(relative_paths) else item[1].name))
+        for chapter_index,(_, pdf) in enumerate(indexed,1):
+            volume=extract_volume_number(pdf.stem)
+            label=f'volume-{volume:03d}' if volume is not None else safe_name(pdf.stem)
+            chapter_dir=target/f'{chapter_index:04d}-{label}'
+            extract_pdf(pdf,chapter_dir)
         return
     image_rows=[]
     for index,path in enumerate(paths):
@@ -312,6 +344,17 @@ def prepare_local_import(paths: list[Path], target: Path, relative_paths: list[s
 def natural_sort_key(path: Path | str):
     value=str(path)
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r'(\d+)',value)]
+
+
+def extract_volume_number(value: str) -> int | None:
+    match=re.search(r'\b(?:vol(?:ume)?|v)\s*[._-]?\s*(\d+)\b',str(value),re.I)
+    return int(match.group(1)) if match else None
+
+
+def volume_sort_key(path: Path | str):
+    value=str(path)
+    volume=extract_volume_number(value)
+    return (0,volume,natural_sort_key(value)) if volume is not None else (1,0,natural_sort_key(value))
 
 
 def export_paths(title: str) -> tuple[Path,Path,Path]:
@@ -356,6 +399,7 @@ def clean_chapter_label(label: str) -> str:
     label=html.unescape(label).replace('_',' ').replace('-',' ').strip()
     label=re.sub(r'^\d+[\s._]+','',label)
     label=re.sub(r'^chapter\s*[._-]*\s*(\d+(?:\.\d+)?)$',r'Chapter \1',label,flags=re.I)
+    label=re.sub(r'^volume\s*[._-]*\s*0*(\d+)$',r'Volume \1',label,flags=re.I)
     label=re.sub(r'\s+',' ',label)
     return label[:1].upper()+label[1:] if label else 'Chapter'
 
@@ -573,13 +617,42 @@ def request_delay(value: object, default: float = 1.0) -> float:
         return default
 
 
+def update_job(job_id: str, message: str) -> None:
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id].update({'status': 'working', 'message': message})
+
+
+def download_to_path(url: str, target: Path, delay: float) -> Path:
+    if target.exists() and target.stat().st_size > 0:
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(fetch(url, delay=delay))
+    return target
+
+
+def save_source_folder(source: Path, title: str) -> tuple[Path, Path] | None:
+    if not source.is_dir():
+        return None
+    saved = OUTPUT / 'crawled' / safe_name(title)
+    saved.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, saved, dirs_exist_ok=True)
+    zip_path = EXPORTS / safe_name(title) / 'files' / f'{safe_name(title)}.source.zip'
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(saved.rglob('*'), key=lambda item: natural_sort_key(str(item))):
+            if path.is_file():
+                archive.write(path, path.relative_to(saved.parent))
+    return saved, zip_path
+
+
 def convert_job(job_id: str, payload: dict[str, object]) -> None:
     temp: Path | None = None
     upload_dir=Path(str(payload['_upload_dir'])) if payload.get('_upload_dir') else None
     try:
-        folder_mode=str(payload.get('folder_mode','combined'))
+        folder_mode=str(payload.get('folder_mode','combined')); save_source=str(payload.get('save_source','false')).lower()=='true' if isinstance(payload.get('save_source'),str) else bool(payload.get('save_source',False))
         profile=PROFILES.get(str(payload.get('profile')),PROFILES['original']); delay=request_delay(payload.get('delay')); webtoon=str(payload.get('webtoon',False)).lower()=='true' if isinstance(payload.get('webtoon'),str) else bool(payload.get('webtoon',False)); direction=str(payload.get('direction','auto')); requested_format=str(payload.get('format','auto')); packaging=str(payload.get('packaging','combined')); quality=str(payload.get('quality','balanced')); divider=str(payload.get('divider',False)).lower()=='true' if isinstance(payload.get('divider'),str) else bool(payload.get('divider',False)); author=str(payload.get('author') or '').strip(); export_name=safe_name(str(payload.get('export_name') or '').strip()) if str(payload.get('export_name') or '').strip() else ''
-        selected=payload.get('chapters',[]); requested_title=safe_name(str(payload.get('title') or '')); title='Comic'; source_url=''; temp=Path(tempfile.mkdtemp(prefix='panel-press-')); source=temp/'source'; all_pages=[]
+        selected=payload.get('chapters',[]); requested_title=safe_name(str(payload.get('title') or '')); title='Comic'; source_url=''; temp=Path(tempfile.mkdtemp(prefix='panel-press-')); source=temp/'source'; all_pages=[]; source_archive=None
         if payload.get('files'):
             paths=[Path(p) for p in payload['files']]
             relative_paths=payload.get('relative_paths')
@@ -592,16 +665,34 @@ def convert_job(job_id: str, payload: dict[str, object]) -> None:
             else:
                 prepare_local_import(paths,source,relative_paths)
         else:
-            url=str(payload['url']); source_url=url; discovered_title, _ = scan(url, delay); title=requested_title or safe_name(discovered_title); source.mkdir(parents=True,exist_ok=True)
+            url=str(payload['url']); source_url=url; locator=payload.get('locator') if isinstance(payload.get('locator'),dict) else None
+            # The browser already scanned the series. Reuse the selected rows
+            # instead of fetching and parsing the entire series a second time.
+            discovered_title=Path(urlparse(url).path.rstrip('/')).name or 'Comic'
+            title=requested_title or safe_name(discovered_title); source.mkdir(parents=True,exist_ok=True)
+            update_job(job_id, f'Preparing {len(selected)} selected chapter(s)…')
+            page_jobs=[]
             for ci,row in enumerate(selected,1):
                 chapter=Chapter(str(row.get('number','')),str(row.get('title','Chapter')),str(row['url']),str(row.get('chapter_id','')))
+                update_job(job_id, f'Discovering pages for chapter {chapter.number} ({ci}/{len(selected)})…')
                 folder=source/f'{ci:04d}-{safe_name(chapter.title or "chapter-"+chapter.number)}'; folder.mkdir(exist_ok=True)
-                pages=chapter_pages(chapter,delay)
-                for pi,page in enumerate(pages,1):
-                    dest=folder/f'{pi:04d}.{guess_extension(page)}'
-                    if not dest.exists(): dest.write_bytes(fetch(page,delay=delay))
-                all_pages.extend(sorted(folder.glob('*')))
+                pages=chapter_pages(chapter,delay,locator)
+                page_jobs.extend((ci,chapter.number,page,folder/f'{pi:04d}.{guess_extension(page)}') for pi,page in enumerate(pages,1))
+            total_pages=len(page_jobs); completed=0
+            update_job(job_id, f'Downloading 0/{total_pages} pages with {DOWNLOAD_WORKERS} workers…')
+            with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+                futures=[pool.submit(download_to_path,page,target,delay) for _,_,page,target in page_jobs]
+                for future in as_completed(futures):
+                    future.result(); completed+=1
+                    if completed==total_pages or completed%5==0:
+                        update_job(job_id, f'Downloading {completed}/{total_pages} pages…')
+            all_pages=sorted((p for p in source.rglob('*') if p.is_file()),key=natural_sort_key)
             if not all_pages: raise RuntimeError('No pages were found in the selected chapters.')
+        if save_source:
+            saved_source=save_source_folder(source,title)
+            if saved_source:
+                source_archive=saved_source[1]
+                update_job(job_id, f'Saved source images to output/crawled/{saved_source[0].name}/…')
         direction=resolve_direction(direction, source_url, title, webtoon)
         kcc_input=kcc_source_root(source)
         export_root,output_dir,chapter_output_dir=export_paths(title)
@@ -615,6 +706,7 @@ def convert_job(job_id: str, payload: dict[str, object]) -> None:
         output_dir.mkdir(parents=True,exist_ok=True)
         pdf_output=requested_format.lower()=='pdf'
         navigation_pages=divider and packaging=='combined' and not pdf_output
+        update_job(job_id, f'Packaging {len(all_pages)} pages with {profile["label"]}…')
         kcc_files=run_kcc(kcc_input,title,profile,output_dir,webtoon,direction,requested_format,packaging,quality,navigation_pages,author)
         if kcc_files:
             kcc_files=rename_outputs(kcc_files,output_dir,title,kcc_input,packaging,export_name or title)
@@ -637,6 +729,9 @@ def convert_job(job_id: str, payload: dict[str, object]) -> None:
             elif ext=='pdf': make_pdf(flat,out)
             else: make_cbz(flat,title,out)
             files=['/downloads/'+out.name]; message=f'Built {out.name} with {len(pages)} pages using the built-in fallback. Install KCC to enable native MOBI/KEPUB output.'
+        if source_archive:
+            files.append('/downloads/'+source_archive.name)
+            message += f' Source images saved under output/crawled/{safe_name(title)}/.'
         if separate_folders:
             message += f' Separate chapter folders were created under output/exports/{safe_name(title)}/chapters/.'
         with JOBS_LOCK: JOBS[job_id]={'status':'done','message':message,'files':files}
@@ -676,7 +771,7 @@ class Handler(BaseHTTPRequestHandler):
         if content_type.startswith('multipart/form-data'):
             form=cgi.FieldStorage(fp=__import__('io').BytesIO(raw),headers=self.headers,environ={'REQUEST_METHOD':'POST','CONTENT_TYPE':content_type,'CONTENT_LENGTH':str(length)})
             upload_dir=Path(tempfile.mkdtemp(prefix='panel-upload-')); paths=[]
-            fields={'profile':'original','delay':'1','webtoon':'false','direction':'auto','title':'Comic','author':'','export_name':'','relative_paths':'[]','format':'auto','packaging':'combined','quality':'balanced','divider':'false'}
+            fields={'profile':'original','delay':'1','webtoon':'false','direction':'auto','title':'Comic','author':'','export_name':'','relative_paths':'[]','format':'auto','packaging':'combined','quality':'balanced','divider':'false','chapter_href_pattern':'','chapter_number_pattern':'','page_list_suffix':'','save_source':'false'}
             for key in fields:
                 if key in form: fields[key]=form.getfirst(key)
             items=form['files'] if 'files' in form and isinstance(form['files'],list) else ([form['files']] if 'files' in form else [])
@@ -684,14 +779,14 @@ class Handler(BaseHTTPRequestHandler):
                 name=safe_name(Path(item.filename or 'upload').name)
                 path=upload_dir/f'{item_index:06d}-{name}'
                 path.write_bytes(item.file.read()); paths.append(str(path))
-            payload={**fields,'files':paths,'webtoon':fields['webtoon']=='true','_upload_dir':str(upload_dir)}
+            payload={**fields,'files':paths,'webtoon':fields['webtoon']=='true','locator':{key:fields[key] for key in ('chapter_href_pattern','chapter_number_pattern','page_list_suffix') if fields[key].strip()},'_upload_dir':str(upload_dir)}
             try: payload['relative_paths']=json.loads(fields['relative_paths'])
             except json.JSONDecodeError: payload['relative_paths']=[]
         else:
             payload=json.loads(raw or b'{}')
         try:
             if self.path in {'/api/v1/scans','/api/scan'}:
-                title, chapters=scan(str(payload['url']),request_delay(payload.get('delay'))); self.send_json({'title':title,'chapters':[c.__dict__ for c in chapters]}); return
+                title, chapters=scan(str(payload['url']),request_delay(payload.get('delay')),payload.get('locator') if isinstance(payload.get('locator'),dict) else None); self.send_json({'title':title,'chapters':[c.__dict__ for c in chapters]}); return
             if self.path in {'/api/v1/conversions','/api/convert'}:
                 job_id=uuid.uuid4().hex; with_lock={'status':'working','message':'Queued…'}
                 with JOBS_LOCK: JOBS[job_id]=with_lock

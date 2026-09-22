@@ -90,9 +90,22 @@ def fetch(url: str, *, retries: int = 3, delay: float = 0.0) -> bytes:
     raise RuntimeError(f"Unable to fetch {url}: {last_error}")
 
 
-def parse_chapter_number(label: str) -> str | None:
-    match = re.search(r"\bchapter\s+([0-9]+(?:[.]\d+)?)\b", label, re.I)
-    return match.group(1) if match else None
+DEFAULT_CHAPTER_NUMBER_PATTERN = r"\b(?:chapter|ch|episode|ep|volume|vol|meeting)\s*[._#:-]*\s*([0-9]+(?:[.]\d+)?)\b"
+
+
+def parse_chapter_number(label: str, pattern: str | None = None) -> str | None:
+    # WeebCentral may label installments as Chapter, Ch., Episode, Volume,
+    # or titles such as Meeting 1.
+    try:
+        match = re.search(pattern or DEFAULT_CHAPTER_NUMBER_PATTERN, label, re.I)
+    except re.error:
+        match = re.search(DEFAULT_CHAPTER_NUMBER_PATTERN, label, re.I)
+    return match.group(1) if match and match.lastindex else None
+
+
+def clean_chapter_label(label: str) -> str:
+    """Remove reader-status metadata that sites append to chapter links."""
+    return re.sub(r"\s+last\s+read\b.*$", "", " ".join(label.split()), flags=re.I).strip()
 
 
 def number_key(number: str) -> tuple[int, int]:
@@ -100,7 +113,7 @@ def number_key(number: str) -> tuple[int, int]:
     return int(whole), int((fraction + "00")[:2]) if fraction else 0
 
 
-def discover_chapters(series_url: str, delay: float) -> tuple[str, list[Chapter]]:
+def discover_chapters(series_url: str, delay: float, locator: dict[str, object] | None = None) -> tuple[str, list[Chapter]]:
     base = f"{urlparse(series_url).scheme}://{urlparse(series_url).netloc}"
     series_html = fetch(series_url, delay=delay).decode("utf-8", "replace")
     parser = PageParser()
@@ -108,26 +121,44 @@ def discover_chapters(series_url: str, delay: float) -> tuple[str, list[Chapter]
     series_title = re.search(r"<h1[^>]*>\s*(.*?)\s*</h1>", series_html, re.I | re.S)
     title = re.sub(r"<[^>]+>", "", series_title.group(1)).strip() if series_title else "series"
 
-    # The initial page is intentionally partial; this endpoint contains every chapter.
-    full_list_url = urljoin(series_url, re.search(r'hx-get="([^"]+/full-chapter-list)"', series_html).group(1)) if re.search(r'hx-get="([^"]+/full-chapter-list)"', series_html) else urljoin(series_url, "full-chapter-list")
-    chapter_html = fetch(full_list_url, delay=delay).decode("utf-8", "replace")
-    parser = PageParser()
-    parser.feed(chapter_html)
+    # Older pages exposed a full-chapter-list endpoint. Newer pages can render
+    # the complete list directly, so parse both and tolerate an empty endpoint.
+    chapter_pages = [series_html]
+    locator = locator or {}
+    href_pattern = str(locator.get("chapter_href_pattern") or r"/chapters/")
+    number_pattern = str(locator.get("chapter_number_pattern") or DEFAULT_CHAPTER_NUMBER_PATTERN)
+    try:
+        href_re = re.compile(href_pattern, re.I)
+    except re.error:
+        href_re = re.compile(r"/chapters/", re.I)
+    endpoint_match = re.search(r'hx-get="([^"]+/full-chapter-list)"', series_html)
+    full_list_url = urljoin(series_url, endpoint_match.group(1) if endpoint_match else "full-chapter-list")
+    try:
+        chapter_pages.insert(0, fetch(full_list_url, delay=delay).decode("utf-8", "replace"))
+    except RuntimeError:
+        pass
+
     chapters: dict[str, Chapter] = {}
-    for href, label in parser.links:
-        if "/chapters/" not in href:
-            continue
-        number = parse_chapter_number(label)
-        if number is None:
-            continue
-        url = urljoin(base, href)
-        chapter_id = url.rstrip("/").split("/")[-1]
-        chapters[chapter_id] = Chapter(number, label, url, chapter_id)
+    for chapter_page in chapter_pages:
+        parser = PageParser()
+        parser.feed(chapter_page)
+        for href, label in parser.links:
+            if not href_re.search(href):
+                continue
+            number = parse_chapter_number(label, number_pattern)
+            if number is None:
+                continue
+            label = clean_chapter_label(label)
+            url = urljoin(base, href)
+            chapter_id = url.rstrip("/").split("/")[-1]
+            chapters[chapter_id] = Chapter(number, label, url, chapter_id)
     return title, sorted(chapters.values(), key=lambda c: number_key(c.number))
 
 
-def discover_pages(chapter: Chapter, delay: float) -> list[str]:
-    images_url = chapter.url.rstrip("/") + "/images?is_prev=False"
+def discover_pages(chapter: Chapter, delay: float, locator: dict[str, object] | None = None) -> list[str]:
+    locator = locator or {}
+    page_suffix = str(locator.get("page_list_suffix") or "/images?is_prev=False")
+    images_url = chapter.url.rstrip("/") + page_suffix
     html = fetch(images_url, delay=delay).decode("utf-8", "replace")
     parser = PageParser()
     parser.feed(html)
