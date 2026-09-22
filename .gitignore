@@ -1,0 +1,51 @@
+# macOS and editor metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.vscode/
+.idea/
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# Test, coverage, and type-checker caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local logs and runtime files
+*.log
+*.pid
+*.pidfile
+*.sqlite
+*.sqlite3
+
+# Generated crawler and conversion output
+output/*
+!output/.gitkeep
+
+# Temporary files and archives created during local processing
+tmp/
+temp/
+*.part
+*.crdownload
+
+# Build artifacts
+build/
+dist/
+*.spec.bak
