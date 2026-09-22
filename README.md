@@ -157,7 +157,7 @@ below with the canonical repository or your fork where appropriate:
   author = {{Panel Press contributors}},
   year   = {2026},
   note   = {Web UI and crawler built on Kindle Comic Converter (KCC)},
-  url    = {https://github.com/<owner>/panel-press}
+  url    = {https://github.com/finnhuynh65/panel-press}
 }
 ```
 
