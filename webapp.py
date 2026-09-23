@@ -74,10 +74,10 @@ INDEX_HTML = r'''<!doctype html>
 <div class="top"><div class="brand"><div class="mark">▤</div><div><div class="eyebrow">Local web converter</div><h1>Panel Press</h1><p>From web page to reader-ready file.</p></div></div><div class="pill">Kindle · Kobo · CBZ</div></div>
 <section class="hero"><div class="eyebrow">Your reading shelf, rebuilt</div><h2>Turn a chapter link into a <em>clean comic file.</em></h2><p>Paste a series URL, choose the pages you want, and package them for your e-reader. The parser is source-agnostic and can be tuned for other sites.</p></section>
 <div class="grid"><section class="card"><h3>1 · Find your source</h3><div class="field"><label for="url">Series or chapter URL</label><input class="input" id="url" value="https://weebcentral.com/series/01J76XYBR7JHFW7Q80MHJP5VYW/Fire-Punch" placeholder="https://example.com/series/..." type="url"><div class="hint">The default adapter understands WeebCentral. Generic sites use visible chapter links and page images.</div></div><div class="field"><label for="files">Or import local images / PDF / folder</label><input class="input" id="files" type="file" multiple webkitdirectory directory accept=".pdf,.jpg,.jpeg,.png,.webp,.gif,.json"><div class="hint">Choose individual files or a crawler folder such as <code>output/crawled/Fire_Punch</code>. Crawler metadata preserves the source URL used to infer reading direction.</div></div><div class="row"><div class="field"><label for="title">Book name</label><input class="input" id="title" placeholder="Uses the source title if blank" type="text"><div class="hint">Used for the combined file and as the prefix for batch files.</div></div><div class="field"><label for="profile">Reader profile</label><select id="profile"><option value="kindle-paperwhite">Kindle Paperwhite · 1072×1448</option><option value="kindle-scribe">Kindle Scribe · 1860×2480</option><option value="kobo-clara">Kobo Clara · 1072×1448</option><option value="kobo-libra">Kobo Libra · 1264×1680</option><option value="original">Original dimensions</option></select></div></div><div class="row"><div class="field"><label for="format">Output format</label><select id="format"><option value="auto">Auto · use profile</option><option value="mobi">MOBI · requires KindleGen</option><option value="epub">EPUB · Send to Kindle / Kobo</option><option value="kepub">KEPUB · Kobo</option><option value="cbz">CBZ · archive</option><option value="pdf">PDF · fixed pages</option></select></div><div class="field"><label for="quality">Image quality</label><select id="quality"><option value="balanced">Balanced · KCC optimized</option><option value="best">Best quality · larger file</option><option value="compact">Compact · smaller file</option></select></div></div><div class="row"><div class="field"><label for="packaging">Packaging</label><select id="packaging"><option value="combined">One file · chapter navigation</option><option value="separate">Separate file per chapter</option></select></div><div class="field"><label for="direction">Reading direction</label><select id="direction"><option value="auto">Auto · detect from source</option><option value="ltr">Left to right</option><option value="rtl">Right to left · manga</option></select><div class="hint">Auto uses manga defaults for known manga sources and keeps webtoons left-to-right.</div></div></div><div class="row"><div class="field"><label for="webtoon">Processing mode</label><select id="webtoon"><option value="false">Manga / comic pages</option><option value="true">Webtoon · long strips</option></select></div><div class="field"><label for="divider">Chapter divider</label><select id="divider"><option value="false">No divider page</option><option value="true">Add divider before each chapter</option></select></div></div><div class="actions"><button class="button primary" id="scan">Scan chapters</button><span class="status" id="scanStatus"></span></div></section>
-<section class="card"><h3>2 · Select & package</h3><div id="chapterList" class="empty">Scan a link or choose local files.</div><div class="actions"><button class="button secondary" id="all" disabled>Select all</button><button class="button primary" id="convert" disabled>Build reader file</button></div><div class="hint">KCC uses MOBI for Kindle only when KindleGen is available; otherwise it creates fixed-layout EPUB for Send to Kindle. Kobo profiles produce KEPUB/EPUB. A compatible CBZ/EPUB fallback is available if KCC dependencies are missing.</div></section></div>
+<section class="card"><h3>2 · Review sample & package</h3><div id="chapterList" class="empty">Scan a link or choose local files.</div><div id="scanPreview" class="hint" role="status" aria-live="polite"></div><div class="actions"><button class="button secondary" id="all" disabled>Select all</button><button class="button primary" id="convert" disabled>Build reader file</button></div><div class="hint">KCC uses MOBI for Kindle only when KindleGen is available; otherwise it creates fixed-layout EPUB for Send to Kindle. Kobo profiles produce KEPUB/EPUB. A compatible CBZ/EPUB fallback is available if KCC dependencies are missing.</div></section></div>
 <section class="card" style="margin-top:20px"><h3>Activity</h3><div class="log" id="log">Ready. Downloads happen on this machine, so the browser never needs direct access to the source site.</div><div class="footer">Use only material you are authorized to download. Based on the ordered-image, device-profile, and webtoon workflow documented by <a href="https://github.com/ciromattia/kcc" target="_blank">KCC</a>.</div></section>
 </main><script>
-let chapters=[];const $=id=>document.getElementById(id);const read=(id,fallback='')=>{const el=$(id);return el?el.value:fallback};const selectedFiles=()=>Array.from($('files')?.files||[]);function log(t){const el=$('log');if(el)el.textContent=t}
+let chapters=[],scanReady=false;const $=id=>document.getElementById(id);const read=(id,fallback='')=>{const el=$(id);return el?el.value:fallback};const selectedFiles=()=>Array.from($('files')?.files||[]);const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));function log(t){const el=$('log');if(el)el.textContent=t}
 function updateCompatibility(capabilities={}){const profile=read('profile');const format=$('format');const kepub=format?.querySelector('option[value="kepub"]');const mobi=format?.querySelector('option[value="mobi"]');if(kepub){kepub.disabled=!profile.startsWith('kobo');if(kepub.disabled&&format.value==='kepub')format.value='auto'}if(mobi){mobi.disabled=capabilities.kindlegen===false;mobi.textContent=capabilities.kindlegen?'MOBI · requires KindleGen':'MOBI · unavailable (KindleGen missing)'}const direction=$('direction');if(direction){direction.disabled=read('webtoon')==='true';if(direction.disabled)direction.value='auto'}const divider=$('divider');if(divider){divider.disabled=read('packaging')==='separate';if(divider.disabled)divider.value='false'}}
 ['profile','format','packaging','webtoon'].forEach(id=>$(id)?.addEventListener('change',()=>updateCompatibility()));fetch('/api/capabilities').then(r=>r.json()).then(updateCompatibility).catch(()=>updateCompatibility());updateCompatibility();
 function explainDisabledFormats(){const profile=read('profile');const kepub=$('format')?.querySelector('option[value="kepub"]');const mobi=$('format')?.querySelector('option[value="mobi"]');if(kepub)kepub.title=kepub.disabled?'Choose a Kobo profile to enable KEPUB.':'';if(mobi)mobi.title=mobi.disabled?'Install KindleGen or choose EPUB/CBZ/PDF instead.':''}['profile','format'].forEach(id=>$(id)?.addEventListener('change',explainDisabledFormats));explainDisabledFormats();
@@ -101,10 +101,12 @@ const folderMode=document.createElement('select');folderMode.id='folder_mode';fo
 const nativeFetch=window.fetch;window.fetch=(url,options={})=>{if(url==='/api/v1/conversions'&&options.body){if(options.body instanceof FormData){options.body.append('folder_mode',folderMode.value)}else{const data=JSON.parse(options.body);data.folder_mode=folderMode.value;options.body=JSON.stringify(data)}}return nativeFetch(url,options)};
 const locatorFetch=window.fetch;window.fetch=(url,options={})=>{if(options.body&&(url==='/api/v1/scans'||url==='/api/v1/conversions')){if(options.body instanceof FormData){const locator=readLocator();for(const [key,value] of Object.entries(locator))options.body.append(key,value)}else{const data=JSON.parse(options.body);data.locator=readLocator();options.body=JSON.stringify(data)}}return locatorFetch(url,options)};
 const sourceFetch=window.fetch;window.fetch=(url,options={})=>{if(url==='/api/v1/conversions'&&options.body){if(options.body instanceof FormData)options.body.append('save_source',read('save_source','false'));else{const data=JSON.parse(options.body);data.save_source=read('save_source','false');options.body=JSON.stringify(data)}}return sourceFetch(url,options)};
-$('files').onchange=()=>{if($('files').files.length){chapters=[];const images=[...$('files').files].filter(f=>/\.(jpe?g|png|webp|gif|pdf)$/i.test(f.name));$('chapterList').className='empty';$('chapterList').textContent=images.length+' image/PDF file(s) ready. Build the reader file to continue.';$('all').disabled=true;$('convert').disabled=images.length===0;$('scanStatus').textContent='Local import selected'}};
-$('scan').onclick=async()=>{const url=read('url').trim();if(!url)return; $('scan').disabled=true;$('scanStatus').textContent='Fetching metadata…';log('Scanning '+url+'\nRespecting the configured request delay.');try{const r=await fetch('/api/v1/scans',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url,delay:Number(read('delay','1'))})});const d=await r.json();if(!r.ok)throw Error(d.error);chapters=d.chapters||[];render();$('scanStatus').textContent=d.title+' · '+chapters.length+' chapters';log('Found '+chapters.length+' chapters in “'+d.title+'”. Select what you want to package.')}catch(e){$('scanStatus').textContent='Scan failed';log('Error: '+e.message)}finally{$('scan').disabled=false}}
-function render(){const box=$('chapterList');if(!chapters.length){box.className='empty';box.textContent='No chapters found automatically. Open “Advanced source locator” above and enter a pattern, then scan again. Example: Chapter\\s+(\\d+)';const details=document.querySelector('details');if(details)details.open=true;$('all').disabled=true;$('convert').disabled=true;return}const range=readChapterRange();const selectedCount=chapters.filter(chapterInRange).length;box.className='chapters';box.innerHTML=chapters.map((c,i)=>`<label class="chapter"><input type="checkbox" data-i="${i}" ${chapterInRange(c)?'checked':''}><span><strong>${c.title||'Chapter '+c.number}</strong><small>${c.number?'Chapter '+c.number+' · ':''}${c.url}</small></span></label>`).join('');$('all').disabled=false;$('all').textContent=range.from!==null||range.to!==null?'Select all in range':'Select all';$('convert').disabled=selectedCount===0;$('scanStatus').textContent=$('scanStatus').textContent.replace(/ · selected \d+ chapters$/,'')+(range.from!==null||range.to!==null?' · selected '+selectedCount+' chapters':'')}
-$('all').onclick=()=>document.querySelectorAll('.chapter input').forEach((x,i)=>x.checked=chapterInRange(chapters[i]));
+$('files').onchange=()=>{if($('files').files.length){chapters=[];scanReady=false;$('scanPreview').textContent='';const images=[...$('files').files].filter(f=>/\.(jpe?g|png|webp|gif|pdf)$/i.test(f.name));$('chapterList').className='empty';$('chapterList').textContent=images.length+' image/PDF file(s) ready. Build the reader file to continue.';$('all').disabled=true;$('convert').disabled=images.length===0;$('scanStatus').textContent='Local import selected'}};
+$('scan').onclick=async()=>{const url=read('url').trim();if(!url)return;$('files').value='';chapters=[];scanReady=false;$('convert').disabled=true;$('all').disabled=true;$('scanPreview').textContent='Checking a small chapter sample…';$('scan').disabled=true;$('scanStatus').textContent='Fetching chapters and sample pages…';log('Scanning '+url+'\nRespecting the configured request delay.');try{const r=await fetch('/api/v1/scans',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url,delay:Number(read('delay','1'))})});const d=await r.json();if(!r.ok)throw Error(d.error);chapters=d.chapters||[];scanReady=d.ready===true;render();$('scanStatus').textContent=d.title+' · '+chapters.length+' chapters';const sample=(d.preview||[]).map(p=>`<li><strong>${escapeHtml(p.title)}</strong>: ${p.error?escapeHtml(p.error):escapeHtml(p.page_count)+' pages'+(p.first_page?' · <a href="'+escapeHtml(p.first_page)+'" target="_blank" rel="noopener noreferrer">first page</a>':'')}</li>`).join('');$('scanPreview').innerHTML='<strong>Sample preview</strong> · '+(d.preview||[]).length+' of '+chapters.length+' chapters checked'+(sample?'<ul>'+sample+'</ul>':'')+(d.suggestions||[]).map(s=>'<p>'+escapeHtml(s)+'</p>').join('')+(scanReady?'<p>Sample passed. Review the selected chapters, then build.</p>':'<p>Build is available after the sample passes.</p>');log('Found '+chapters.length+' chapters in “'+d.title+'”. '+(scanReady?'Sample pages are available.':'Review the preview suggestions and scan again.'))}catch(e){chapters=[];scanReady=false;render();$('scanPreview').textContent='Scan failed: '+e.message;$('scanStatus').textContent='Scan failed';log('Error: '+e.message)}finally{$('scan').disabled=false}}
+function render(){const box=$('chapterList');if(!chapters.length){box.className='empty';box.textContent='No chapters found automatically. Open “Advanced source locator” above and enter a pattern, then scan again.';const details=document.querySelector('details');if(details)details.open=true;$('all').disabled=true;$('convert').disabled=true;return}const range=readChapterRange();const selectedCount=chapters.filter(chapterInRange).length;box.className='chapters';box.innerHTML=chapters.map((c,i)=>`<label class="chapter"><input type="checkbox" data-i="${i}" ${chapterInRange(c)?'checked':''}><span><strong>${escapeHtml(c.title||'Chapter '+c.number)}</strong><small>${c.number?'Chapter '+escapeHtml(c.number)+' · ':''}${escapeHtml(c.url)}</small></span></label>`).join('');$('all').disabled=false;$('all').textContent=range.from!==null||range.to!==null?'Select all in range':'Select all';$('convert').disabled=!scanReady||selectedCount===0;$('scanStatus').textContent=$('scanStatus').textContent.replace(/ · selected \d+ chapters$/,'')+(range.from!==null||range.to!==null?' · selected '+selectedCount+' chapters':'')}
+$('all').onclick=()=>{document.querySelectorAll('.chapter input').forEach((x,i)=>x.checked=chapterInRange(chapters[i]));$('convert').disabled=!scanReady||!document.querySelector('.chapter input:checked')};
+$('chapterList').addEventListener('change',()=>{$('convert').disabled=!scanReady||!document.querySelector('.chapter input:checked')});
+['url','chapter_href_pattern','chapter_number_pattern','page_list_suffix'].forEach(id=>$(id)?.addEventListener('input',()=>{if(chapters.length){scanReady=false;$('convert').disabled=true;$('scanPreview').textContent='Source settings changed. Scan again to check the sample.'}}));
 $('convert').onclick=async()=>{const selected=[...document.querySelectorAll('.chapter input:checked')].map(x=>chapters[Number(x.dataset.i)]);if(!selected.length && !selectedFiles().length)return; $('convert').disabled=true;log('Starting download and packaging…');try{let body,headers={};if(selectedFiles().length){body=new FormData();const files=[...selectedFiles()].filter(f=>/\.(jpe?g|png|webp|gif|pdf|json)$/i.test(f.name)).sort((a,b)=>(a.webkitRelativePath||a.name).localeCompare(b.webkitRelativePath||b.name,undefined,{numeric:true,sensitivity:'base'}));for(const file of files)body.append('files',file);body.append('relative_paths',JSON.stringify(files.map(file=>file.webkitRelativePath||file.name)));body.append('title',read('title')||files[0]?.webkitRelativePath?.split('/')[0]||files[0]?.name?.replace(/\.[^.]+$/,'')||'Comic');body.append('profile',read('profile'));body.append('format',read('format'));body.append('quality',read('quality'));body.append('packaging',read('packaging'));body.append('divider',read('divider'));body.append('delay',read('delay'));body.append('webtoon',read('webtoon'));body.append('direction',read('direction'))}else{headers={'content-type':'application/json'};body=JSON.stringify({url:read('url'),title:read('title'),profile:read('profile'),format:read('format'),quality:read('quality'),packaging:read('packaging'),divider:read('divider'),delay:Number(read('delay')),webtoon:read('webtoon')==='true',direction:read('direction'),chapters:selected})}const r=await fetch('/api/v1/conversions',{method:'POST',headers,body});const d=await r.json();if(!r.ok)throw Error(d.error);poll(d.job_id)}catch(e){log('Error: '+e.message);$('convert').disabled=false}}
 async function poll(id){const r=await fetch('/api/v1/conversions/'+id),d=await r.json();log(d.message||'Working…');if(d.status==='done'){log(d.message+'\n\nDownload: '+d.files.join(', '));$('convert').disabled=false;return}if(d.status==='error'){$('convert').disabled=false;return}setTimeout(()=>poll(d.job_id||id),900)}
 </script></body></html>'''
@@ -144,8 +146,13 @@ def generic_discover(series_url: str, delay: float, locator: dict[str, object] |
     return parser.title or Path(urlparse(series_url).path).name or 'Comic', rows
 
 
+def is_weebcentral_url(url: str) -> bool:
+    host = (urlparse(url).hostname or '').lower()
+    return host == 'weebcentral.com' or host.endswith('.weebcentral.com')
+
+
 def scan(url: str, delay: float, locator: dict[str, object] | None = None):
-    if 'weebcentral.com' in urlparse(url).netloc:
+    if is_weebcentral_url(url):
         return discover_chapters(url, delay, locator)
     return generic_discover(url, delay, locator)
 
@@ -166,9 +173,56 @@ def generic_discover_pages(chapter: Chapter, delay: float) -> list[str]:
 
 
 def chapter_pages(chapter: Chapter, delay: float, locator: dict[str, object] | None = None) -> list[str]:
-    if 'weebcentral.com' in urlparse(chapter.url).netloc:
+    if is_weebcentral_url(chapter.url):
         return discover_pages(chapter, delay, locator)
     return generic_discover_pages(chapter, delay)
+
+
+def scan_preview(url: str, delay: float, locator: dict[str, object] | None = None) -> dict[str, object]:
+    """Discover chapters and check a small, distributed sample before conversion."""
+    parsed = urlparse(url)
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname:
+        raise ValueError('Enter an HTTP or HTTPS series URL.')
+    locator = locator or {}
+    for key in ('chapter_href_pattern', 'chapter_number_pattern'):
+        pattern = locator.get(key)
+        if pattern:
+            try:
+                re.compile(str(pattern))
+            except re.error as exc:
+                raise ValueError(f'Invalid {key}: {exc}') from exc
+            if key == 'chapter_number_pattern' and re.compile(str(pattern)).groups < 1:
+                raise ValueError('Chapter number pattern needs a capture group, for example (\\d+).')
+    title, chapters = scan(url, delay, locator)
+    if not chapters and re.search(r'(?:chapter|episode|/ch[-_]?\d+|/ep[-_]?\d+)', parsed.path, re.I):
+        chapter = Chapter('', title or 'Chapter', url, parsed.path.rstrip('/').split('/')[-1])
+        chapters = [chapter]
+    if not chapters:
+        return {'title': title, 'chapters': [], 'preview': [], 'ready': False,
+                'suggestions': ['No chapter links matched. Open Advanced source locator and set a chapter link pattern that matches the chapter URLs, then scan again.']}
+    indices = sorted({0, len(chapters) // 2, len(chapters) - 1})
+    preview = []
+    for index in indices:
+        chapter = chapters[index]
+        try:
+            pages = chapter_pages(chapter, delay, locator)
+            first_page = pages[0] if pages and urlparse(pages[0]).scheme in {'http', 'https'} else None
+            preview.append({'index': index, 'title': chapter.title, 'url': chapter.url,
+                            'page_count': len(pages), 'first_page': first_page,
+                            'error': None if pages else 'No page images found.'})
+        except Exception as exc:
+            preview.append({'index': index, 'title': chapter.title, 'url': chapter.url,
+                            'page_count': 0, 'first_page': None, 'error': str(exc)})
+    failures = [row for row in preview if row['error']]
+    suggestions = []
+    if failures:
+        suggestions.append('Some sampled chapters have no readable pages. Check their links and adjust the source locator before building.')
+        if is_weebcentral_url(url):
+            suggestions.append('For this source, check the page-list URL suffix in Advanced source locator.')
+        else:
+            suggestions.append('Generic parsing reads image tags on chapter pages; a source that loads images through scripts may need a site-specific adapter.')
+    return {'title': title, 'chapters': [c.__dict__ for c in chapters], 'preview': preview,
+            'ready': not failures, 'suggestions': suggestions}
 
 
 def normalize_image(source: Path, target: Path, size: tuple[int, int]) -> None:
@@ -834,7 +888,10 @@ class Handler(BaseHTTPRequestHandler):
             payload=json.loads(raw or b'{}')
         try:
             if self.path in {'/api/v1/scans','/api/scan'}:
-                title, chapters=scan(str(payload['url']),request_delay(payload.get('delay')),payload.get('locator') if isinstance(payload.get('locator'),dict) else None); self.send_json({'title':title,'chapters':[c.__dict__ for c in chapters]}); return
+                result = scan_preview(str(payload['url']), request_delay(payload.get('delay')),
+                                      payload.get('locator') if isinstance(payload.get('locator'), dict) else None)
+                self.send_json(result)
+                return
             if self.path in {'/api/v1/conversions','/api/convert'}:
                 job_id=uuid.uuid4().hex; with_lock={'status':'working','message':'Queued…'}
                 with JOBS_LOCK: JOBS[job_id]=with_lock

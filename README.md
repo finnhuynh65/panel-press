@@ -65,7 +65,7 @@ Use `PORT=8081 ./start.sh` to run it on another port.
 
 For complete Terminal instructions, see [START.md](START.md).
 
-Paste a series URL, scan its chapters, select the chapters to include, and
+Paste a series or chapter URL, scan its chapters, review the page counts and first-page links from a sample of up to three chapters, select the chapters to include, and
 build a reader file. The UI also accepts local image files, a single PDF,
 several PDFs (imported as ordered chapter folders), or a whole crawler folder.
 Panel Press includes the KCC source under `vendor/kcc` and invokes its official
@@ -131,6 +131,11 @@ reads image tags from each chapter page (including common lazy-loading
 attributes such as `data-src`). For a site with a different structure, add a
 site-specific adapter beside `generic_discover` and `generic_discover_pages`
 in `webapp.py`.
+
+The scan checks the first, middle, and last chapter when available. It shows
+errors and source-locator suggestions if a sampled chapter has no readable
+pages, and enables Build after the sample passes. The sample is a quick check;
+other chapters are discovered during conversion.
 
 Crawler downloads are stored under `output/crawled/<series>/`. Converted files
 are stored separately under `output/exports/<book>/files/`, with batch chapter
