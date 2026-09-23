@@ -1,2 +1,11 @@
+[project]
+name = "panel-press"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "Pillow>=11.3,<13",
+    "vercel",
+]
+
 [[tool.vercel.subscribers]]
 entrypoint = "queues.conversions"
