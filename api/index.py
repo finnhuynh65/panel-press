@@ -6,7 +6,7 @@ import json
 import os
 import asyncio
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 import webapp
 from vercel.functions import RuntimeCache
@@ -78,6 +78,13 @@ class handler(webapp.Handler):
             self.send_header('Vary', 'Origin')
         super().end_headers()
 
+    def _route_path(self) -> str:
+        parsed = urlsplit(self.path)
+        rewritten = parse_qs(parsed.query).get('__pp_route', [])
+        if rewritten and rewritten[0].startswith('/api/'):
+            return rewritten[0]
+        return parsed.path
+
     def do_OPTIONS(self) -> None:
         if not self._allowed_origin():
             self.send_error(403)
@@ -88,24 +95,26 @@ class handler(webapp.Handler):
         self.end_headers()
 
     def do_GET(self) -> None:
-        if self.path in {'/api/v1/capabilities', '/api/capabilities'}:
+        route = self._route_path()
+        if route in {'/api/v1/capabilities', '/api/capabilities'}:
             self.send_json({'kcc': False, 'kindlegen': False, 'pillow': webapp._has_pillow(),
                             'hosted': True, 'max_chapters': MAX_CHAPTERS,
                             'max_pages': webapp.MAX_HOSTED_PAGES,
                             'max_total_bytes': webapp.MAX_HOSTED_BYTES,
                             'max_page_bytes': webapp.MAX_HOSTED_PAGE_BYTES})
             return
-        if self.path.startswith('/api/v1/conversions/'):
-            self.send_json(conversion_status(self.path.rsplit('/', 1)[-1]))
+        if route.startswith('/api/v1/conversions/'):
+            self.send_json(conversion_status(route.rsplit('/', 1)[-1]))
             return
         self.send_error(404)
 
     def do_POST(self) -> None:
+        route = self._route_path()
         origin = self.headers.get('Origin')
         if origin and not self._allowed_origin():
             self.send_json({'error': 'Origin is not allowed.'}, 403)
             return
-        if self.path not in {'/api/v1/scans', '/api/scan', '/api/v1/conversions', '/api/convert'}:
+        if route not in {'/api/v1/scans', '/api/scan', '/api/v1/conversions', '/api/convert'}:
             self.send_error(404)
             return
         content_type = self.headers.get('Content-Type', '')
@@ -122,7 +131,7 @@ class handler(webapp.Handler):
                 raise ValueError('Expected a JSON object.')
             if 'files' in payload or '_upload_dir' in payload:
                 raise ValueError('Local files are not supported by the hosted API.')
-            if self.path in {'/api/v1/scans', '/api/scan'}:
+            if route in {'/api/v1/scans', '/api/scan'}:
                 result = webapp.scan_preview(str(payload.get('url') or ''),
                                              webapp.request_delay(payload.get('delay')),
                                              payload.get('locator') if isinstance(payload.get('locator'), dict) else None)
