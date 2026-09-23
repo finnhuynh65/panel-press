@@ -1,6 +1,8 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
+  "buildCommand": "cd apps/web && npm run build",
+  "outputDirectory": "apps/web/dist",
   "functions": {
     "api/index.py": {
       "maxDuration": 300,

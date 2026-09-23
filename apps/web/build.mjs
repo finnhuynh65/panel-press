@@ -1,9 +1,9 @@
 import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const apiOrigin = (process.env.PANEL_API_ORIGIN || (process.env.VERCEL ? '' : 'http://127.0.0.1:8080')).replace(/\/$/, '');
-if (!/^https?:\/\/[^/]+$/.test(apiOrigin)) {
-  throw new Error('Set PANEL_API_ORIGIN to the deployed API origin, such as https://panel-press-api.vercel.app');
+const apiOrigin = (process.env.VERCEL ? '' : (process.env.PANEL_API_ORIGIN || 'http://127.0.0.1:8080')).replace(/\/$/, '');
+if (apiOrigin && !/^https?:\/\/[^/]+$/.test(apiOrigin)) {
+  throw new Error('PANEL_API_ORIGIN must be an origin such as https://example.vercel.app');
 }
 
 mkdirSync('dist', { recursive: true });

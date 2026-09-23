@@ -71,8 +71,8 @@ Use `PORT=8081 ./start.sh` to run it on another port.
 
 For complete Terminal instructions, see [START.md](START.md).
 
-To deploy the frontend and the bounded Python API as two Vercel projects from
-this repository, with Vercel Queues handling queued conversion work, follow
+To deploy the frontend and bounded Python API together as one Vercel project,
+with Vercel Queues handling queued conversion work, follow
 [VERCEL.md](VERCEL.md).
 
 Paste a series or chapter URL, scan its chapters, review the page counts and first-page links from a sample of up to three chapters, select the chapters to include, and
