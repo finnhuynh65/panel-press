@@ -41,6 +41,10 @@ EXPORTS = OUTPUT / "exports"
 JOBS: dict[str, dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
 DOWNLOAD_WORKERS = 4
+MAX_HOSTED_CHAPTERS = 3
+MAX_HOSTED_PAGES = 300
+MAX_HOSTED_BYTES = 256 * 1024 * 1024
+MAX_HOSTED_PAGE_BYTES = 16 * 1024 * 1024
 MAX_JOBS = 50
 MAX_JSON_BYTES = 1_000_000
 MAX_UPLOAD_BYTES = 1_000_000_000
@@ -344,7 +348,7 @@ def rewrite_epub(epub: Path, replacements: dict[str, bytes], removed: set[str] |
 
 def find_kcc() -> list[str] | None:
     """Find the official KCC CLI without making it a hard dependency."""
-    if os.environ.get('VERCEL'):
+    if os.environ.get('VERCEL') or os.environ.get('PANEL_DISABLE_KCC'):
         return None
     configured=os.environ.get('KCC_COMMAND')
     if configured: return shlex.split(configured)
@@ -803,7 +807,7 @@ def queue_job(payload: dict[str, object], upload_dir: Path | None) -> str | None
     return job_id
 
 
-def download_to_path(url: str, target: Path, delay: float) -> Path:
+def download_to_path(url: str, target: Path, delay: float, max_bytes: int | None = None) -> Path:
     if target.suffix == '.img':
         for suffix in ('.jpg', '.png', '.gif', '.webp'):
             existing = target.with_suffix(suffix)
@@ -812,7 +816,7 @@ def download_to_path(url: str, target: Path, delay: float) -> Path:
     if target.suffix != '.img' and target.exists() and target.stat().st_size > 0:
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
-    data = fetch(url, delay=delay)
+    data = fetch(url, delay=delay, max_bytes=max_bytes)
     if target.suffix == '.img':
         extension = image_extension(data[:12])
         if extension is None:
@@ -855,7 +859,7 @@ def source_images(source: Path) -> list[Path]:
 
 
 def prepare_source(job_id: str, payload: dict[str, object], temporary: Path,
-                   options: ConversionOptions) -> PreparedSource:
+                   options: ConversionOptions, *, hosted_limits: bool = False) -> PreparedSource:
     source = temporary / 'source'
     if payload.get('files'):
         paths = [Path(path) for path in payload['files']]
@@ -886,15 +890,30 @@ def prepare_source(job_id: str, payload: dict[str, object], temporary: Path,
         folder = source / f'{index:04d}-{safe_name(chapter.title or "chapter-" + chapter.number)}'
         folder.mkdir(exist_ok=True)
         for page_index, page in enumerate(chapter_pages(chapter, options.delay, locator), 1):
+            if hosted_limits and len(page_jobs) >= MAX_HOSTED_PAGES:
+                raise RuntimeError(f'This conversion exceeds the hosted page limit of {MAX_HOSTED_PAGES}.')
             page_jobs.append((page, folder / f'{page_index:04d}.{guess_extension(page)}'))
     total_pages = len(page_jobs)
+    if hosted_limits and total_pages > MAX_HOSTED_PAGES:
+        raise RuntimeError(f'This conversion found {total_pages} pages; the hosted worker limit is {MAX_HOSTED_PAGES}.')
     update_job(job_id, f'Downloading 0/{total_pages} pages with {DOWNLOAD_WORKERS} workers…')
-    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
-        futures = [pool.submit(download_to_path, page, target, options.delay) for page, target in page_jobs]
-        for completed, future in enumerate(as_completed(futures), 1):
-            future.result()
+    if hosted_limits:
+        downloaded_bytes = 0
+        for completed, (page, target) in enumerate(page_jobs, 1):
+            remaining = MAX_HOSTED_BYTES - downloaded_bytes
+            if remaining <= 0:
+                raise RuntimeError(f'This conversion reached the hosted download limit of {MAX_HOSTED_BYTES} bytes.')
+            downloaded = download_to_path(page, target, options.delay, min(MAX_HOSTED_PAGE_BYTES, remaining))
+            downloaded_bytes += downloaded.stat().st_size
             if completed == total_pages or completed % 5 == 0:
-                update_job(job_id, f'Downloading {completed}/{total_pages} pages…')
+                update_job(job_id, f'Downloading {completed}/{total_pages} pages ({downloaded_bytes} bytes)…')
+    else:
+        with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+            futures = [pool.submit(download_to_path, page, target, options.delay) for page, target in page_jobs]
+            for completed, future in enumerate(as_completed(futures), 1):
+                future.result()
+                if completed == total_pages or completed % 5 == 0:
+                    update_job(job_id, f'Downloading {completed}/{total_pages} pages…')
     page_count = len(source_images(source))
     if not page_count:
         raise RuntimeError('No pages were found in the selected chapters.')
@@ -930,12 +949,13 @@ def build_fallback(source: Path, output_dir: Path, title: str, direction: str,
     return output, len(pages)
 
 
-def convert_job(job_id: str, payload: dict[str, object], upload_dir: Path | None = None) -> None:
+def convert_job(job_id: str, payload: dict[str, object], upload_dir: Path | None = None,
+                *, hosted_limits: bool = False) -> None:
     temp: Path | None = None
     try:
         options = ConversionOptions.from_payload(payload)
         temp = Path(tempfile.mkdtemp(prefix='panel-press-'))
-        prepared = prepare_source(job_id, payload, temp, options)
+        prepared = prepare_source(job_id, payload, temp, options, hosted_limits=hosted_limits)
         source, title = prepared.path, prepared.title
         _, output_dir, chapter_output_dir = export_paths(title, job_id)
         source_archive = None

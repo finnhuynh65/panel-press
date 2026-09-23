@@ -4,26 +4,24 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
-import tempfile
+import asyncio
 import uuid
-from pathlib import Path
 from urllib.parse import urlparse
 
 import webapp
+from vercel.functions import RuntimeCache
+from vercel.queue import send
 
 
-# Functions can write to /tmp, while the deployed source tree is read-only.
-webapp.OUTPUT = Path(tempfile.gettempdir()) / 'panel-press-output'
-webapp.EXPORTS = webapp.OUTPUT / 'exports'
-MAX_CHAPTERS = 3
+MAX_CHAPTERS = webapp.MAX_HOSTED_CHAPTERS
 MAX_BODY_BYTES = 1_000_000
+JOB_TTL_SECONDS = 7 * 24 * 60 * 60
+QUEUE_TOPIC = 'panel-press-conversions'
+JOB_CACHE = RuntimeCache(namespace='panel-press-jobs')
 
 
-def convert_small(payload: dict[str, object]) -> dict[str, object]:
-    """Build during the request and publish the finished files to Blob."""
-    if not os.environ.get('BLOB_READ_WRITE_TOKEN'):
-        raise RuntimeError('BLOB_READ_WRITE_TOKEN is required for hosted conversions.')
+def enqueue_conversion(payload: dict[str, object]) -> dict[str, str]:
+    """Persist a conversion request and return without downloading pages."""
     selected = payload.get('chapters')
     if not isinstance(selected, list) or not 1 <= len(selected) <= MAX_CHAPTERS:
         raise ValueError(f'Select 1 to {MAX_CHAPTERS} chapters for a hosted conversion.')
@@ -36,35 +34,31 @@ def convert_small(payload: dict[str, object]) -> dict[str, object]:
     options = webapp.ConversionOptions.from_payload(payload)
     if options.output_format not in {'auto', 'epub', 'cbz'}:
         raise ValueError('Hosted conversion supports Auto, EPUB, and CBZ formats.')
+    if options.packaging != 'combined' or options.divider or options.webtoon:
+        raise ValueError('Hosted conversion supports combined comic or manga EPUB/CBZ output without divider pages.')
+    if options.quality != 'balanced':
+        raise ValueError('Hosted conversion uses balanced image quality.')
 
     job_id = uuid.uuid4().hex
-    with webapp.JOBS_LOCK:
-        webapp.JOBS[job_id] = {'status': 'working', 'message': 'Starting…'}
+    state = {'status': 'queued', 'message': 'Waiting for a worker…', 'files': []}
+    JOB_CACHE.set(f'job:{job_id}', state, {'ttl': JOB_TTL_SECONDS})
     try:
-        webapp.convert_job(job_id, payload)
-        with webapp.JOBS_LOCK:
-            result = dict(webapp.JOBS[job_id])
-        if result.get('status') != 'done':
-            return result
+        asyncio.run(send(QUEUE_TOPIC, {'job_id': job_id, 'payload': payload},
+                         idempotency_key=job_id, retention=JOB_TTL_SECONDS))
+    except Exception:
+        JOB_CACHE.delete(f'job:{job_id}')
+        raise
+    return {'job_id': job_id, 'status': 'queued', 'message': state['message']}
 
-        from vercel.blob import BlobClient
 
-        client = BlobClient()
-        urls = []
-        for download in result['files']:
-            path = webapp.downloadable_path(download)
-            if path is None:
-                raise RuntimeError('Generated file is unavailable.')
-            blob = client.put(f'panel-press/{job_id}/{path.name}', path.read_bytes(),
-                              access='public', content_type='application/octet-stream')
-            urls.append(blob.url)
-        return {'status': 'done', 'message': result['message'], 'files': urls}
-    finally:
-        with webapp.JOBS_LOCK:
-            webapp.JOBS.pop(job_id, None)
-        # Every conversion writes to its own job directory.
-        for book in webapp.EXPORTS.glob('*'):
-            shutil.rmtree(book / job_id, ignore_errors=True)
+def conversion_status(job_id: str) -> dict[str, object]:
+    if not all(char in '0123456789abcdef' for char in job_id) or len(job_id) != 32:
+        return {'status': 'error', 'message': 'Unknown job.'}
+    row = JOB_CACHE.get(f'job:{job_id}')
+    if not row:
+        return {'status': 'error', 'message': 'Unknown or expired job.'}
+    return {'status': row.get('status', 'error'), 'message': row.get('message', ''),
+            'files': row.get('files', [])}
 
 
 class handler(webapp.Handler):
@@ -96,7 +90,13 @@ class handler(webapp.Handler):
     def do_GET(self) -> None:
         if self.path in {'/api/v1/capabilities', '/api/capabilities'}:
             self.send_json({'kcc': False, 'kindlegen': False, 'pillow': webapp._has_pillow(),
-                            'hosted': True, 'max_chapters': MAX_CHAPTERS})
+                            'hosted': True, 'max_chapters': MAX_CHAPTERS,
+                            'max_pages': webapp.MAX_HOSTED_PAGES,
+                            'max_total_bytes': webapp.MAX_HOSTED_BYTES,
+                            'max_page_bytes': webapp.MAX_HOSTED_PAGE_BYTES})
+            return
+        if self.path.startswith('/api/v1/conversions/'):
+            self.send_json(conversion_status(self.path.rsplit('/', 1)[-1]))
             return
         self.send_error(404)
 
@@ -127,7 +127,7 @@ class handler(webapp.Handler):
                                              webapp.request_delay(payload.get('delay')),
                                              payload.get('locator') if isinstance(payload.get('locator'), dict) else None)
             else:
-                result = convert_small(payload)
+                result = enqueue_conversion(payload)
             self.send_json(result)
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             self.send_json({'error': str(exc)}, 400)

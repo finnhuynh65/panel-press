@@ -63,7 +63,7 @@ class Chapter:
     chapter_id: str
 
 
-def fetch(url: str, *, retries: int = 3, delay: float = 0.0) -> bytes:
+def fetch(url: str, *, retries: int = 3, delay: float = 0.0, max_bytes: int | None = None) -> bytes:
     scheme = urlparse(url).scheme.lower()
     if scheme not in ("http", "https"):
         raise RuntimeError(f"Unsupported URL scheme for {url!r}: only http and https are allowed")
@@ -74,6 +74,14 @@ def fetch(url: str, *, retries: int = 3, delay: float = 0.0) -> bytes:
     for attempt in range(max(1, retries)):
         try:
             with urlopen(request, timeout=45) as response:
+                if max_bytes is not None:
+                    content_length = response.headers.get('Content-Length')
+                    if content_length and int(content_length) > max_bytes:
+                        raise RuntimeError(f'Resource exceeds the {max_bytes}-byte image limit: {url}')
+                    data = response.read(max_bytes + 1)
+                    if len(data) > max_bytes:
+                        raise RuntimeError(f'Resource exceeds the {max_bytes}-byte image limit: {url}')
+                    return data
                 return response.read()
         except HTTPError as exc:
             last_error = exc

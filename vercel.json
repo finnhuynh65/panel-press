@@ -5,6 +5,9 @@
     "api/index.py": {
       "maxDuration": 300,
       "excludeFiles": "{apps/**,tests/**,output/**,vendor/**,openspec/**}"
+    },
+    "queues/conversions.py": {
+      "maxDuration": 300
     }
   },
   "rewrites": [
