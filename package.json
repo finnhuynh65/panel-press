@@ -1,0 +1,10 @@
+{
+  "name": "panel-press-vercel",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "esbuild": "^0.25.0",
+    "jszip": "^3.10.2",
+    "pdfjs-dist": "^6.3.289"
+  }
+}

@@ -5,8 +5,11 @@
   "outputDirectory": "apps/web/dist",
   "functions": {
     "api/index.py": {
-      "maxDuration": 300,
+      "maxDuration": 60,
       "excludeFiles": "{apps/**,tests/**,output/**,vendor/**,openspec/**}"
+    },
+    "api/page-image.js": {
+      "maxDuration": 30
     }
   },
   "rewrites": [

@@ -1,49 +1,22 @@
 # Vercel deployment
 
-Deploy the frontend, Python API, and queue consumer as **one Vercel project**.
-The project root is the repository root (`.`); the root configuration builds
-the static interface from `apps/web` and routes `/api/*` to the Python API.
+Deploy the frontend and API as **one Vercel project** with the repository root (`.`) as the project root. The static interface is built from `apps/web`; Python handles chapter discovery and page manifests; a Node function streams source images to the browser.
 
 ## Configure the project
 
-1. Set the Vercel project's **Root Directory** to the repository root.
-2. Enable Vercel Queues for the project. The API publishes conversion jobs to
-   `panel-press-conversions`; `pyproject.toml` registers the Python subscriber.
-3. Create a **public** Vercel Blob store and enable its read-write token for
-   this project.
-4. Deploy. The frontend always calls `/api/*` on its own domain in Vercel.
-   `PANEL_API_ORIGIN` is only used by local builds.
+1. Set the Vercel project's Root Directory to the repository root.
+2. Deploy. No Blob store, queue, Redis, or storage token is required.
 
-`vercel.json` runs `cd apps/web && npm run build`, serves `apps/web/dist`, and
-routes `/api/*` to `api/index.py`. The API accepts same-origin requests without
-extra CORS settings.
-
-Vercel Queues invokes the Python consumer and retries failed deliveries. Job
-status and progress are stored in Vercel Runtime Cache for seven days. Finished
-exports are uploaded to Blob in 1 MiB chunks, so the complete archive is never
-copied into one in-memory byte string.
+`vercel.json` builds `apps/web/dist`, routes `/api/*` to the Python API, and exposes `/api/page-image` as a streaming image proxy. URL conversion downloads selected chapter pages sequentially into the browser, stores them in IndexedDB, and creates EPUB/CBZ files locally. Local image imports use the same browser-side path. No source images or finished books are uploaded to a storage service.
 
 ## Hosted limits
 
-- Select up to three chapters per conversion. The queue consumer also stops
-  before downloading more than 300 pages, 256 MiB total, or 16 MiB for one
-  image. These limits are in [`webapp.py`](webapp.py).
-- Hosted conversion accepts URL sources and produces Auto, EPUB, or CBZ. Use
-  the local app for PDF/MOBI/KEPUB, local uploads, source-folder exports, or
-  larger batches.
-- The queue consumer downloads hosted page images sequentially to enforce the
-  total byte cap with bounded memory. Vercel Queues controls delivery
-  concurrency.
-- Vercel Functions limit request and response bodies to 4.5 MB. Finished files
-  go from the queue consumer to Vercel Blob in chunks, so they do not pass
-  through the API response. Blob URLs are public and can be opened by anyone
-  who has the URL.
+- Select any number of chapters. Each chapter is a separate download; chapters over 300 pages or 128 MiB are split into numbered parts. Each image is limited to 16 MiB. The browser discovers chapter page lists and fetches images concurrently, using the visible concurrency setting (1–6, default 3) and image request delay. It builds one part at a time. It keeps chapter files and source pages in IndexedDB. A batch ZIP is available for saved chapter files up to 256 MiB; larger batches remain available as individual downloads.
+- Keep the browser tab open while pages are downloaded and the reader file is built. Page images and the finished file remain in browser memory/IndexedDB; clear saved images and chapter downloads from the interface when no longer needed. Browser storage quota varies by device and browser.
+- Browser-side conversion supports EPUB and CBZ. PDF/MOBI/KEPUB and KCC device processing require the desktop app.
+- The image proxy only accepts public HTTP(S) image hosts and streams each response with a 16 MiB cap.
 
-See [Vercel's monorepo guide](https://vercel.com/docs/monorepos),
-[Python runtime guide](https://vercel.com/docs/functions/runtimes/python),
-[Queues guide](https://vercel.com/docs/queues),
-[Function limits](https://vercel.com/docs/functions/limitations), and
-[Blob upload guide](https://vercel.com/docs/vercel-blob/using-blob-sdk).
+See [Vercel's monorepo guide](https://vercel.com/docs/monorepos), [Python runtime guide](https://vercel.com/docs/functions/runtimes/python), and [Function limits](https://vercel.com/docs/functions/limitations).
 
 ## Local checks
 
@@ -52,5 +25,4 @@ python3 -m unittest discover -s tests -v
 cd apps/web && npm run build
 ```
 
-For a local frontend build, `PANEL_API_ORIGIN` defaults to
-`http://127.0.0.1:8080`; start the local API with `python3 webapp.py`.
+For a local frontend build, `PANEL_API_ORIGIN` defaults to `http://127.0.0.1:8080`; start the local API with `python3 webapp.py`.

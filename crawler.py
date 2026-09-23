@@ -71,7 +71,8 @@ def fetch(url: str, *, retries: int = 3, delay: float = 0.0, max_bytes: int | No
         time.sleep(delay)
     request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,image/*,*/*;q=0.8"})
     last_error: Exception | None = None
-    for attempt in range(max(1, retries)):
+    attempts = max(1, retries)
+    for attempt in range(attempts):
         try:
             with urlopen(request, timeout=45) as response:
                 if max_bytes is not None:
@@ -85,7 +86,7 @@ def fetch(url: str, *, retries: int = 3, delay: float = 0.0, max_bytes: int | No
                 return response.read()
         except HTTPError as exc:
             last_error = exc
-            if exc.code not in {429, 500, 502, 503, 504} or attempt + 1 >= max(1, retries):
+            if exc.code not in {429, 500, 502, 503, 504} or attempt + 1 >= attempts:
                 break
             if exc.code == 429:
                 retry_after = exc.headers.get("Retry-After") if exc.headers else None
@@ -98,7 +99,7 @@ def fetch(url: str, *, retries: int = 3, delay: float = 0.0, max_bytes: int | No
                 time.sleep(2 ** attempt)
         except (URLError, TimeoutError) as exc:
             last_error = exc
-            if attempt + 1 < max(1, retries):
+            if attempt + 1 < attempts:
                 time.sleep(2 ** attempt)
     raise RuntimeError(f"Unable to fetch {url}: {last_error}")
 

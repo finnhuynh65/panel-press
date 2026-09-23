@@ -2,7 +2,7 @@
 
 Small, resumable crawler for a manga series. It discovers the complete chapter list, preserves chapter order, writes metadata, and optionally downloads page images into one folder per chapter.
 
-Use this only where you have permission to download the material. Check the source site's terms and robots policy, and keep the rate limit conservative.
+Use this only where you have permission to download and convert the material. Check the source site's terms and robots policy, and keep the rate limit conservative. A page being publicly viewable does not by itself grant permission to download, redistribute, or publish a converted copy.
 
 ## Usage
 
@@ -71,8 +71,8 @@ Use `PORT=8081 ./start.sh` to run it on another port.
 
 For complete Terminal instructions, see [START.md](START.md).
 
-To deploy the frontend and bounded Python API together as one Vercel project,
-with Vercel Queues handling queued conversion work, follow
+To deploy the frontend and API together as one Vercel project, with browser-side
+page fetching and EPUB/CBZ packaging and no remote object storage, follow
 [VERCEL.md](VERCEL.md).
 
 Paste a series or chapter URL, scan its chapters, review the page counts and first-page links from a sample of up to three chapters, select the chapters to include, and
@@ -164,6 +164,18 @@ can still set `KCC_COMMAND` to override the bundled copy. MOBI conversion
 additionally requires KindleGen/Kindle Previewer, as it does in KCC itself;
 that proprietary tool is not bundled.
 
+## Responsible use and source credit
+
+Before scanning a URL or importing files, confirm that you own the pages, have a license or permission for this use, or are using another source that explicitly allows it. Respect access controls, site terms, robots rules, and request limits. Do not use Panel Press to bypass restrictions or to share source images or ebooks without the rights to do so.
+
+Keep a record of the source title, creator, URL, license or permission, and access date for each imported work. If you share a result where permitted, credit the original creator and source under their stated terms. A citation to Panel Press or KCC credits the software; it does **not** replace permission or attribution for the artwork.
+
+## KCC workflow and attribution
+
+Panel Press follows KCC's documented [folder and image inputs](https://github.com/ciromattia/kcc#input-formats), [device profiles and manga/webtoon options](https://github.com/ciromattia/kcc#usage). For predictable page order, name source images sequentially (for example, `0001.jpg`, `0002.jpg`) and put each chapter in its own ordered folder. Choose the profile for the device you will read on; it controls the target page size. Select right-to-left for manga that reads that way, and use webtoon processing for long vertical strips in the desktop KCC path. Preview the result before distributing it, if your rights allow distribution.
+
+The desktop app invokes bundled KCC when its dependencies are available. Its fallback converter and the browser EPUB/CBZ builder are Panel Press implementations; they do not run KCC. The browser currently does not offer KCC's webtoon processing. See the [KCC README](https://github.com/ciromattia/kcc/blob/master/README.md) and bundled [ISC license](vendor/kcc/LICENSE.txt) for KCC's own usage guidance and terms.
+
 ## Citation
 
 If Panel Press is useful in your work, cite this repository. Replace the URL
@@ -179,8 +191,7 @@ below with the canonical repository or your fork where appropriate:
 }
 ```
 
-Conversion output is produced by KCC. If you publish results that relied on
-KCC, cite it as well:
+If your results used the desktop KCC conversion path, cite KCC as well:
 
 ```bibtex
 @software{kcc,

@@ -4,11 +4,30 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 import crawler
 
 
 class ResumeTests(unittest.TestCase):
+    def test_fetch_does_not_retry_permanent_http_error(self):
+        error = HTTPError('https://example.org/missing', 404, 'Not found', {}, None)
+        with patch.object(crawler, 'urlopen', side_effect=error) as request, \
+             patch.object(crawler.time, 'sleep') as sleep:
+            with self.assertRaises(RuntimeError):
+                crawler.fetch('https://example.org/missing', retries=3)
+            self.assertEqual(request.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_fetch_retries_transient_error_without_final_sleep(self):
+        error = HTTPError('https://example.org/busy', 503, 'Unavailable', {}, None)
+        with patch.object(crawler, 'urlopen', side_effect=error) as request, \
+             patch.object(crawler.time, 'sleep') as sleep:
+            with self.assertRaises(RuntimeError):
+                crawler.fetch('https://example.org/busy', retries=3)
+            self.assertEqual(request.call_count, 3)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+
     def test_extensionless_image_url_uses_detected_format(self):
         image = b'GIF89a' + b'payload'
         with tempfile.TemporaryDirectory() as directory, \

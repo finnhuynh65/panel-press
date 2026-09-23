@@ -1,14 +1,10 @@
-"""Checks for the bounded Vercel API boundary."""
+"""Tests for the hosted page-manifest API."""
 
 import http.client
 import json
-import os
-import tempfile
 import threading
-import types
 import unittest
 from http.server import ThreadingHTTPServer
-from pathlib import Path
 from unittest.mock import patch
 
 from api import index as hosted
@@ -29,56 +25,32 @@ class HostedAPITests(unittest.TestCase):
         connection = http.client.HTTPConnection('127.0.0.1', self.server.server_port)
         connection.request(method, path, body, headers or {})
         response = connection.getresponse()
-        result = response.status, dict(response.getheaders()), response.read()
+        result = response.status, json.loads(response.read() or b'{}')
         connection.close()
         return result
 
-    def test_scan_returns_preview_with_configured_cors_origin(self):
+    def test_manifest_preserves_page_order_and_allows_part_sized_chapter_batches(self):
+        chapter = {'url': 'https://example.org/chapter/1', 'title': 'Chapter 1', 'number': '1'}
+        with patch.object(hosted.webapp, 'chapter_pages', return_value=['https://cdn.example/1.jpg', 'https://cdn.example/2.jpg']):
+            result = hosted.conversion_pages({'url': 'https://example.org/series/Test', 'chapters': [chapter], 'delay': 0})
+        self.assertEqual([page['page_index'] for page in result['pages']], [1, 2])
+        self.assertEqual(result['pages'][0]['referer'], chapter['url'])
+        with self.assertRaisesRegex(ValueError, 'one chapter per page manifest'):
+            hosted.conversion_pages({'url': 'https://example.org/series', 'chapters': [chapter] * 4})
+        with patch.object(hosted.webapp, 'chapter_pages', return_value=[f'https://cdn.example/{i}.jpg' for i in range(301)]):
+            manifest = hosted.conversion_pages({'url': 'https://example.org/series', 'chapters': [chapter], 'delay': 0})
+        self.assertEqual(len(manifest['pages']), 301)
+        self.assertEqual(manifest['max_part_pages'], 300)
+
+    def test_pages_endpoint_returns_manifest(self):
         preview = {'title': 'Book', 'chapters': [], 'preview': [], 'ready': False, 'suggestions': []}
-        with patch.dict(os.environ, {'PANEL_WEB_ORIGIN': 'https://web.example'}), \
-             patch.object(hosted.webapp, 'scan_preview', return_value=preview):
-            status, headers, body = self.request('POST', '/api/v1/scans',
-                json.dumps({'url': 'https://example.org/series'}),
-                {'Content-Type': 'application/json', 'Origin': 'https://web.example'})
+        chapter = {'url': 'https://example.org/chapter/1', 'title': 'Chapter 1', 'number': '1'}
+        with patch.object(hosted.webapp, 'chapter_pages', return_value=['https://cdn.example/1.jpg']):
+            status, result = self.request('POST', '/api/v1/pages', json.dumps({
+                'url': 'https://example.org/series/Book', 'chapters': [chapter], 'delay': 0,
+            }), {'Content-Type': 'application/json'})
         self.assertEqual(status, 200)
-        self.assertEqual(headers['Access-Control-Allow-Origin'], 'https://web.example')
-        self.assertEqual(json.loads(body), preview)
-
-    def test_hosted_conversion_caps_chapters(self):
-        with patch.dict(os.environ, {'BLOB_READ_WRITE_TOKEN': 'test'}):
-            with self.assertRaisesRegex(ValueError, '1 to 3 chapters'):
-                hosted.convert_small({'url': 'https://example.org/series', 'chapters': [{}] * 4})
-
-    def test_completed_file_is_published_to_blob(self):
-        uploaded = []
-
-        class BlobClient:
-            def put(self, name, body, **options):
-                uploaded.append((name, body, options))
-                return types.SimpleNamespace(url='https://blob.example/book.cbz')
-
-        def fake_convert(job_id, payload):
-            path = hosted.webapp.EXPORTS / 'Book' / job_id / 'files' / 'book.cbz'
-            path.parent.mkdir(parents=True)
-            path.write_bytes(b'book')
-            hosted.webapp.JOBS[job_id] = {'status': 'done', 'message': 'Built.',
-                                            'files': [hosted.webapp.download_url(path)]}
-
-        fake_vercel = types.ModuleType('vercel')
-        fake_blob = types.ModuleType('vercel.blob')
-        fake_blob.BlobClient = BlobClient
-        fake_vercel.blob = fake_blob
-        payload = {'url': 'https://example.org/series', 'chapters': [{'url': 'https://example.org/chapter/1'}],
-                   'format': 'cbz'}
-        with tempfile.TemporaryDirectory() as directory, \
-             patch.dict(os.environ, {'BLOB_READ_WRITE_TOKEN': 'test'}), \
-             patch.dict('sys.modules', {'vercel': fake_vercel, 'vercel.blob': fake_blob}), \
-             patch.object(hosted.webapp, 'EXPORTS', Path(directory)), \
-             patch.object(hosted.webapp, 'convert_job', fake_convert):
-            result = hosted.convert_small(payload)
-        self.assertEqual(result['files'], ['https://blob.example/book.cbz'])
-        self.assertEqual(uploaded[0][1], b'book')
-        self.assertEqual(uploaded[0][2]['access'], 'public')
+        self.assertEqual(result['pages'][0]['url'], 'https://cdn.example/1.jpg')
 
 
 if __name__ == '__main__':

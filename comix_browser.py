@@ -9,28 +9,14 @@ material you are authorized to download.
 from __future__ import annotations
 
 import argparse
-import json
 import re
-import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-from playwright.sync_api import sync_playwright
+from crawler import safe_name, write_json
 
 
 CHROME_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
-
-
-def safe_name(value: str) -> str:
-    cleaned = re.sub(r"[^\w.\- ]+", "_", str(value), flags=re.UNICODE)
-    cleaned = re.sub(r"\s+", "_", cleaned).strip("._")
-    cleaned = re.sub(r"_{2,}", "_", cleaned)
-    return cleaned or "untitled"
-
-
-def write_json(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def chapter_number(url: str, fallback: int) -> str:
@@ -61,14 +47,17 @@ def extract_pages(page, chapter_url: str) -> list[str]:
 
 
 def crawl(series_url: str, output: Path, metadata_only: bool) -> None:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError('Install Playwright and its Chromium browser to crawl Comix.') from exc
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
         context = browser.new_context(user_agent=CHROME_UA, viewport={"width": 1440, "height": 900})
         page = context.new_page()
-        title = urlparse(series_url).path.rstrip("/").split("/")[-1].split("-")[-1] or "comix"
-        title = page.title() if page.url else title
+        title = urlparse(series_url).path.rstrip("/").split("/")[-1].split("-", 1)[-1] or "comix"
         chapters = discover_chapters(page, series_url)
-        title = page.title() or title
+        title = page.title().strip() or title
         root = output / safe_name(title)
         (root / "chapters").mkdir(parents=True, exist_ok=True)
         rows = []

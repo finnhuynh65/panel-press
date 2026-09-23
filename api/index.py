@@ -1,68 +1,61 @@
-"""Vercel entry point for bounded, URL-based Panel Press conversions."""
+"""Vercel API for chapter discovery and image-page manifests."""
 
 from __future__ import annotations
 
 import json
 import os
-import asyncio
-import uuid
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse, urlsplit
 
 import webapp
-from vercel.functions import RuntimeCache
-from vercel.queue import send
 
-
-MAX_CHAPTERS = webapp.MAX_HOSTED_CHAPTERS
+MAX_CHAPTERS_PER_MANIFEST = 1
 MAX_BODY_BYTES = 1_000_000
-JOB_TTL_SECONDS = 7 * 24 * 60 * 60
-QUEUE_TOPIC = 'panel-press-conversions'
-JOB_CACHE = RuntimeCache(namespace='panel-press-jobs')
+MAX_PACKAGE_PAGES = 300
+MAX_PACKAGE_BYTES = 128 * 1024 * 1024
+MAX_BROWSER_PAGE_BYTES = 16 * 1024 * 1024
 
 
-def enqueue_conversion(payload: dict[str, object]) -> dict[str, str]:
-    """Persist a conversion request and return without downloading pages."""
+def conversion_pages(payload: dict[str, object]) -> dict[str, object]:
+    """Return an ordered page manifest; image transfer and packaging stay in the browser."""
     selected = payload.get('chapters')
-    if not isinstance(selected, list) or not 1 <= len(selected) <= MAX_CHAPTERS:
-        raise ValueError(f'Select 1 to {MAX_CHAPTERS} chapters for a hosted conversion.')
-    if not isinstance(payload.get('url'), str) or not payload['url'].strip():
-        raise ValueError('A series URL is required.')
-    if urlparse(payload['url']).scheme not in {'http', 'https'}:
+    if not isinstance(selected, list) or len(selected) != MAX_CHAPTERS_PER_MANIFEST:
+        raise ValueError('Request one chapter per page manifest.')
+    source_url = payload.get('url')
+    if not isinstance(source_url, str) or urlparse(source_url).scheme not in {'http', 'https'}:
         raise ValueError('Enter an HTTP or HTTPS series URL.')
-    if payload.get('save_source') is True or payload.get('save_source') == 'true' or payload.get('folder_mode') == 'separate':
-        raise ValueError('Hosted conversion does not save source folders. Use the local app for that option.')
-    options = webapp.ConversionOptions.from_payload(payload)
-    if options.output_format not in {'auto', 'epub', 'cbz'}:
-        raise ValueError('Hosted conversion supports Auto, EPUB, and CBZ formats.')
-    if options.packaging != 'combined' or options.divider or options.webtoon:
-        raise ValueError('Hosted conversion supports combined comic or manga EPUB/CBZ output without divider pages.')
-    if options.quality != 'balanced':
-        raise ValueError('Hosted conversion uses balanced image quality.')
-
-    job_id = uuid.uuid4().hex
-    state = {'status': 'queued', 'message': 'Waiting for a worker…', 'files': []}
-    JOB_CACHE.set(f'job:{job_id}', state, {'ttl': JOB_TTL_SECONDS})
-    try:
-        asyncio.run(send(QUEUE_TOPIC, {'job_id': job_id, 'payload': payload},
-                         idempotency_key=job_id, retention=JOB_TTL_SECONDS))
-    except Exception:
-        JOB_CACHE.delete(f'job:{job_id}')
-        raise
-    return {'job_id': job_id, 'status': 'queued', 'message': state['message']}
-
-
-def conversion_status(job_id: str) -> dict[str, object]:
-    if not all(char in '0123456789abcdef' for char in job_id) or len(job_id) != 32:
-        return {'status': 'error', 'message': 'Unknown job.'}
-    row = JOB_CACHE.get(f'job:{job_id}')
-    if not row:
-        return {'status': 'error', 'message': 'Unknown or expired job.'}
-    return {'status': row.get('status', 'error'), 'message': row.get('message', ''),
-            'files': row.get('files', [])}
+    delay = webapp.request_delay(payload.get('delay'))
+    locator = payload.get('locator') if isinstance(payload.get('locator'), dict) else None
+    pages: list[dict[str, object]] = []
+    for chapter_index, row in enumerate(selected, 1):
+        if not isinstance(row, dict) or not isinstance(row.get('url'), str):
+            raise ValueError('A selected chapter is invalid.')
+        chapter_url = row['url']
+        if urlparse(chapter_url).scheme not in {'http', 'https'}:
+            raise ValueError('A chapter URL must use HTTP or HTTPS.')
+        chapter = webapp.Chapter(str(row.get('number') or chapter_index),
+                                 str(row.get('title') or f'Chapter {chapter_index}'),
+                                 chapter_url, str(row.get('chapter_id') or ''))
+        image_urls = webapp.chapter_pages(chapter, delay, locator)
+        if not image_urls:
+            raise ValueError(f'No pages were found for {chapter.title}.')
+        for page_index, image_url in enumerate(image_urls, 1):
+            parsed = urlparse(image_url)
+            if parsed.scheme not in {'http', 'https'} or not parsed.hostname or len(image_url) > 2048:
+                raise ValueError('A page image URL is invalid.')
+            pages.append({'url': image_url, 'referer': chapter_url,
+                          'chapter': chapter.title, 'chapter_number': chapter.number,
+                          'chapter_index': chapter_index, 'page_index': page_index})
+    return {'title': Path(urlparse(source_url).path.rstrip('/')).name or 'Comic',
+            'pages': pages, 'max_page_bytes': MAX_BROWSER_PAGE_BYTES,
+            'max_part_pages': MAX_PACKAGE_PAGES,
+            'max_part_bytes': MAX_PACKAGE_BYTES,
+            'delay': delay,
+            'direction': webapp.resolve_direction('auto', source_url)}
 
 
 class handler(webapp.Handler):
-    """Same scan contract as the local app, with Vercel-safe conversion."""
+    """Same scan contract as the local app, with browser-side conversion."""
 
     def _allowed_origin(self) -> str | None:
         origin = self.headers.get('Origin')
@@ -98,13 +91,10 @@ class handler(webapp.Handler):
         route = self._route_path()
         if route in {'/api/v1/capabilities', '/api/capabilities'}:
             self.send_json({'kcc': False, 'kindlegen': False, 'pillow': webapp._has_pillow(),
-                            'hosted': True, 'max_chapters': MAX_CHAPTERS,
-                            'max_pages': webapp.MAX_HOSTED_PAGES,
-                            'max_total_bytes': webapp.MAX_HOSTED_BYTES,
-                            'max_page_bytes': webapp.MAX_HOSTED_PAGE_BYTES})
-            return
-        if route.startswith('/api/v1/conversions/'):
-            self.send_json(conversion_status(route.rsplit('/', 1)[-1]))
+                            'hosted': True, 'chapters_per_manifest': MAX_CHAPTERS_PER_MANIFEST,
+                            'max_pages_per_file': MAX_PACKAGE_PAGES,
+                            'max_total_bytes_per_file': MAX_PACKAGE_BYTES,
+                            'max_page_bytes': MAX_BROWSER_PAGE_BYTES})
             return
         self.send_error(404)
 
@@ -114,29 +104,29 @@ class handler(webapp.Handler):
         if origin and not self._allowed_origin():
             self.send_json({'error': 'Origin is not allowed.'}, 403)
             return
-        if route not in {'/api/v1/scans', '/api/scan', '/api/v1/conversions', '/api/convert'}:
+        if route not in {'/api/v1/scans', '/api/scan', '/api/v1/pages'}:
             self.send_error(404)
             return
         content_type = self.headers.get('Content-Type', '')
         if not content_type.lower().startswith('application/json'):
-            self.send_json({'error': 'Hosted API accepts JSON only. Use the local app for file imports.'}, 415)
+            self.send_json({'error': 'Hosted API accepts JSON only.'}, 415)
             return
         try:
             length = int(self.headers.get('Content-Length', '0'))
             if not 0 < length <= MAX_BODY_BYTES:
-                self.send_json({'error': 'Request body must be between 1 and 1000000 bytes.'}, 413)
+                self.send_json({'error': f'Request body must be between 1 and {MAX_BODY_BYTES} bytes.'}, 413)
                 return
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise ValueError('Expected a JSON object.')
             if 'files' in payload or '_upload_dir' in payload:
-                raise ValueError('Local files are not supported by the hosted API.')
+                raise ValueError('Image files are converted in the browser and must not be uploaded.')
             if route in {'/api/v1/scans', '/api/scan'}:
                 result = webapp.scan_preview(str(payload.get('url') or ''),
                                              webapp.request_delay(payload.get('delay')),
                                              payload.get('locator') if isinstance(payload.get('locator'), dict) else None)
             else:
-                result = enqueue_conversion(payload)
+                result = conversion_pages(payload)
             self.send_json(result)
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             self.send_json({'error': str(exc)}, 400)

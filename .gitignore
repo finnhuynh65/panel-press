@@ -51,3 +51,6 @@ dist/
 
 # OpenSpec planning artifacts
 openspec/
+.vercel
+.env*
+node_modules/
