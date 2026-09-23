@@ -8,6 +8,8 @@ Use this only where you have permission to download the material. Check the sour
 
 No third-party Python packages are required for `crawler.py`.
 
+Run the standard-library regression checks with `python3 -m unittest discover -s tests -v`.
+
 For Comix, install Playwright and its Chromium browser once:
 
 ```bash
@@ -53,6 +55,10 @@ python3 webapp.py
 # open http://127.0.0.1:8080
 ```
 
+The local API accepts JSON for scans and URL-based conversions, and multipart
+uploads for local files. Uploads are limited to 1 GB per request; JSON requests
+are limited to 1 MB. At most 50 conversion jobs are retained or running at once.
+
 Or start the local app with:
 
 ```bash
@@ -64,6 +70,9 @@ On Windows, run `start.bat` from Command Prompt or double-click it.
 Use `PORT=8081 ./start.sh` to run it on another port.
 
 For complete Terminal instructions, see [START.md](START.md).
+
+To deploy the frontend and the bounded Python API as two Vercel projects from
+this repository, follow [VERCEL.md](VERCEL.md).
 
 Paste a series or chapter URL, scan its chapters, review the page counts and first-page links from a sample of up to three chapters, select the chapters to include, and
 build a reader file. The UI also accepts local image files, a single PDF,
@@ -137,11 +146,11 @@ errors and source-locator suggestions if a sampled chapter has no readable
 pages, and enables Build after the sample passes. The sample is a quick check;
 other chapters are discovered during conversion.
 
-Crawler downloads are stored under `output/crawled/<series>/`. Converted files
-are stored separately under `output/exports/<book>/files/`, with batch chapter
-folders under `output/exports/<book>/chapters/`. Enabling the "Source image
-folder" option also copies the staged source images to
-`output/crawled/<book>/` and exports them as a `…source.zip` beside the
+Crawler downloads are stored under `output/crawled/<series>/`. Each conversion
+gets a separate `output/exports/<book>/<job-id>/files/` directory, with batch
+chapter folders under the same job's `chapters/` directory. Enabling the
+"Source image folder" option also copies the staged images to
+`output/crawled/<book>/<job-id>/` and exports them as a `…source.zip` beside the
 converted files. Install the bundled KCC
 runtime packages once per Python environment:
 
