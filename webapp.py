@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import json
 import html
+import copy
+import io
 import mimetypes
+import math
 import os
 import re
 import shlex
@@ -21,13 +24,15 @@ import threading
 import uuid
 import zipfile
 from email import policy as email_policy
+from email.message import Message
 from email.parser import BytesParser
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse, urlsplit
 
-from crawler import Chapter, clean_chapter_label as strip_reader_metadata, discover_chapters, discover_pages, fetch, guess_extension, safe_name
+from crawler import Chapter, clean_chapter_label as strip_reader_metadata, discover_chapters, discover_pages, fetch, guess_extension, image_extension, safe_name
 
 
 ROOT = Path(__file__).resolve().parent
@@ -37,6 +42,9 @@ JOBS: dict[str, dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
 DOWNLOAD_WORKERS = 4
 MAX_JOBS = 50
+MAX_JSON_BYTES = 1_000_000
+MAX_UPLOAD_BYTES = 1_000_000_000
+MAX_FIELD_BYTES = 1_000_000
 
 PROFILES = {
     # Device identifiers and target sizes mirror KCC's built-in profiles.
@@ -227,21 +235,27 @@ def scan_preview(url: str, delay: float, locator: dict[str, object] | None = Non
 
 def normalize_image(source: Path, target: Path, size: tuple[int, int]) -> None:
     try:
-        from PIL import Image, ImageOps
-        image=Image.open(source).convert('RGB')
-        if size != (0, 0): image.thumbnail(size, Image.Resampling.LANCZOS)
-        target.parent.mkdir(parents=True, exist_ok=True); image.save(target, 'JPEG', quality=88, optimize=True)
+        from PIL import Image
+        with Image.open(source) as original:
+            image = original.convert('RGB')
+        try:
+            if size != (0, 0):
+                image.thumbnail(size, Image.Resampling.LANCZOS)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            image.save(target, 'JPEG', quality=88, optimize=True)
+        finally:
+            image.close()
     except ImportError:
         target.parent.mkdir(parents=True, exist_ok=True); shutil.copyfile(source, target)
 
 
 def image_suffix(path: Path) -> str:
     """Prefer the bytes' real format over a misleading source filename."""
-    header=path.read_bytes()[:12]
-    if header.startswith(b'\xff\xd8\xff'): return '.jpg'
-    if header.startswith(b'\x89PNG\r\n\x1a\n'): return '.png'
-    if header.startswith((b'GIF87a',b'GIF89a')): return '.gif'
-    if header[:4]==b'RIFF' and header[8:12]==b'WEBP': return '.webp'
+    with path.open('rb') as source:
+        header = source.read(12)
+    extension = image_extension(header)
+    if extension:
+        return '.' + extension
     return path.suffix.lower() or '.jpg'
 
 
@@ -283,12 +297,12 @@ def make_epub(folder: Path, title: str, out: Path, size: tuple[int,int], directi
             suffix='.jpg' if pillow_available else image_suffix(page); name=f'page-{i:04d}{suffix}'; normalize_image(page, folder / name, size)
             media_type=mimetypes.guess_type(name)[0] or 'image/jpeg'
             z.write(folder/name,'OEBPS/'+name); manifest.append(f'<item id="i{i}" href="{name}" media-type="{media_type}"/>'); manifest.append(f'<item id="p{i}" href="p{i}.xhtml" media-type="application/xhtml+xml"/>'); spine.append(f'<itemref idref="p{i}"/>')
-            z.writestr(f'OEBPS/p{i}.xhtml',f'<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{title}</title><style>html,body{{margin:0;padding:0;text-align:center;background:#000}}img{{max-width:100%;max-height:100vh}}</style></head><body><img src="{name}" alt="Page {i}"/></body></html>')
+            z.writestr(f'OEBPS/p{i}.xhtml',f'<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{html.escape(title)}</title><style>html,body{{margin:0;padding:0;text-align:center;background:#000}}img{{max-width:100%;max-height:100vh}}</style></head><body><img src="{name}" alt="Page {i}"/></body></html>')
         nav_items=''.join(f'<li><a href="p{i}.xhtml">Page {i}</a></li>' for i in range(1,len(pages)+1))
         nav=(f'<?xml version="1.0" encoding="utf-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>{html.escape(title)}</title></head><body><nav epub:type="toc" id="toc"><h1>{html.escape(title)}</h1><ol>{nav_items}</ol></nav></body></html>')
         manifest.append('<item id="nav" href="nav.xhtml" properties="nav" media-type="application/xhtml+xml"/>')
         manifest_xml=''.join(manifest); spine_xml=''.join(spine)
-        opf=f'<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">panel-press-{uuid.uuid4()}</dc:identifier><dc:title>{title}</dc:title><dc:language>en</dc:language><meta property="rendition:layout">pre-paginated</meta><meta property="rendition:orientation">auto</meta></metadata><manifest>{manifest_xml}</manifest><spine page-progression-direction="{direction}">{spine_xml}</spine></package>'
+        opf=f'<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">panel-press-{uuid.uuid4()}</dc:identifier><dc:title>{html.escape(title)}</dc:title><dc:language>en</dc:language><meta property="rendition:layout">pre-paginated</meta><meta property="rendition:orientation">auto</meta></metadata><manifest>{manifest_xml}</manifest><spine page-progression-direction="{direction}">{spine_xml}</spine></package>'
         z.writestr('OEBPS/content.opf',opf)
         z.writestr('OEBPS/nav.xhtml',nav)
 
@@ -297,26 +311,41 @@ def normalize_epub_reading_order(epub: Path, direction: str) -> None:
     """Make KCC EPUBs portable by removing reader-dependent spread hints."""
     if not epub.exists() or epub.suffix.lower() != '.epub':
         return
-    with zipfile.ZipFile(epub, 'r') as archive:
-        members = {info.filename: archive.read(info.filename) for info in archive.infolist()}
     opf_name = 'OEBPS/content.opf'
-    if opf_name not in members:
-        return
-    opf = members[opf_name].decode('utf-8')
+    with zipfile.ZipFile(epub, 'r') as archive:
+        if opf_name not in archive.namelist():
+            return
+        opf = archive.read(opf_name).decode('utf-8')
     opf = re.sub(r'\s+properties="(?:rendition:)?page-spread-(?:left|right)"', '', opf)
     opf = re.sub(r'(<spine\b[^>]*?)page-progression-direction="(?:ltr|rtl)"',
                  rf'\1page-progression-direction="{direction}"', opf, count=1)
-    members[opf_name] = opf.encode('utf-8')
+    rewrite_epub(epub, {opf_name: opf.encode('utf-8')})
+
+
+def rewrite_epub(epub: Path, replacements: dict[str, bytes], removed: set[str] | None = None) -> None:
+    """Rewrite changed EPUB members while streaming page images between archives."""
     temporary = epub.with_suffix(epub.suffix + '.tmp')
-    with zipfile.ZipFile(temporary, 'w', zipfile.ZIP_DEFLATED) as archive:
-        for name, data in members.items():
-            compression = zipfile.ZIP_STORED if name == 'mimetype' else zipfile.ZIP_DEFLATED
-            archive.writestr(name, data, compress_type=compression)
-    temporary.replace(epub)
+    try:
+        with zipfile.ZipFile(epub, 'r') as source, zipfile.ZipFile(temporary, 'w') as destination:
+            destination.comment = source.comment
+            for info in source.infolist():
+                if removed and info.filename in removed:
+                    continue
+                target_info = copy.copy(info)
+                if info.filename in replacements:
+                    destination.writestr(target_info, replacements[info.filename])
+                else:
+                    with source.open(info) as input_file, destination.open(target_info, 'w') as output_file:
+                        shutil.copyfileobj(input_file, output_file, length=1024 * 1024)
+        temporary.replace(epub)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def find_kcc() -> list[str] | None:
     """Find the official KCC CLI without making it a hard dependency."""
+    if os.environ.get('VERCEL'):
+        return None
     configured=os.environ.get('KCC_COMMAND')
     if configured: return shlex.split(configured)
     bundled=ROOT/'vendor'/'kcc'/'kcc-c2e.py'
@@ -412,10 +441,33 @@ def volume_sort_key(path: Path | str):
     return (0,volume,natural_sort_key(value)) if volume is not None else (1,0,natural_sort_key(value))
 
 
-def export_paths(title: str) -> tuple[Path,Path,Path]:
-    """Return isolated export, ebook-file, and batch-chapter directories."""
-    root=EXPORTS/safe_name(title)
+def export_paths(title: str, job_id: str) -> tuple[Path,Path,Path]:
+    """Keep every conversion's artifacts separate, even for repeated titles."""
+    root=EXPORTS/safe_name(title)/job_id
     return root,root/'files',root/'chapters'
+
+
+def download_url(path: Path) -> str:
+    """Address an export by its book directory and filename."""
+    relative = path.relative_to(EXPORTS)
+    if len(relative.parts) != 4 or relative.parts[2] != 'files':
+        raise ValueError(f'Not a downloadable export: {path}')
+    return f'/downloads/{quote(relative.parts[0])}/{relative.parts[1]}/{quote(relative.name)}'
+
+
+def downloadable_path(url_path: str) -> Path | None:
+    parts = url_path.split('/')
+    if len(parts) != 5 or parts[:2] != ['', 'downloads']:
+        return None
+    book, job_id, filename = (unquote(part) for part in parts[2:])
+    if (not re.fullmatch(r'[0-9a-f]{32}', job_id)
+            or not book or not filename
+            or any(part in {'.', '..'} or '/' in part or '\\' in part for part in (book, filename))):
+        return None
+    candidate = EXPORTS / book / job_id / 'files' / filename
+    if not candidate.resolve().is_relative_to(EXPORTS.resolve()):
+        return None
+    return candidate if candidate.is_file() else None
 
 
 def chapter_directories(source: Path) -> list[Path]:
@@ -462,12 +514,16 @@ def clean_chapter_label(label: str) -> str:
 def update_epub_navigation(epub: Path, source: Path | None = None) -> None:
     """Keep KCC's native clickable TOC without adding a physical contents page."""
     if not epub.exists() or not epub.name.endswith('.epub'): return
-    with zipfile.ZipFile(epub,'r') as archive:
-        entries={name:archive.read(name) for name in archive.namelist()}
     nav_name='OEBPS/nav.xhtml'
     opf_name='OEBPS/content.opf'
-    if nav_name not in entries or opf_name not in entries: return
-    nav=entries[nav_name].decode('utf-8')
+    ncx_name='OEBPS/toc.ncx'
+    with zipfile.ZipFile(epub,'r') as archive:
+        names = set(archive.namelist())
+        if nav_name not in names or opf_name not in names:
+            return
+        nav = archive.read(nav_name).decode('utf-8')
+        opf = archive.read(opf_name).decode('utf-8')
+        ncx = archive.read(ncx_name).decode('utf-8') if ncx_name in names else None
     # KCC currently writes a page-list containing the same chapter links as
     # the TOC. It is not a real page index and some readers surface it as a
     # second, misleading contents view.
@@ -490,29 +546,21 @@ def update_epub_navigation(epub: Path, source: Path | None = None) -> None:
 
     nav=re.sub(r'<li>\s*<a href="([^"]+)">([^<]+)</a>\s*</li>',replace_nav_item,nav)
     nav=re.sub(r'<li>\s*<a href="Text/panel-contents\.xhtml">[^<]*</a>\s*</li>\s*','',nav)
-    entries[nav_name]=nav.encode('utf-8')
-
-    opf=entries[opf_name].decode('utf-8')
+    replacements = {nav_name: nav.encode('utf-8')}
     opf=re.sub(r'<item\s+id="panel-contents"[^>]*/>\s*','',opf)
     opf=re.sub(r'<itemref\s+idref="panel-contents"[^>]*/>\s*','',opf)
-    entries[opf_name]=opf.encode('utf-8')
-    entries.pop('OEBPS/Text/panel-contents.xhtml',None)
+    replacements[opf_name] = opf.encode('utf-8')
 
-    ncx_name='OEBPS/toc.ncx'
-    if ncx_name in entries and labels:
-        ncx=entries[ncx_name].decode('utf-8')
+    if ncx is not None and labels:
         def replace_ncx_item(match: re.Match[str]) -> str:
             block=match.group(0)
             href_match=re.search(r'<content\s+src="([^"]+)"',block)
             if not href_match: return block
             href=href_match.group(1)
             return re.sub(r'(<navLabel>\s*<text>).*?(</text>)',rf'\1{html.escape(labels.get(href, "Chapter"))}\2',block,count=1,flags=re.S)
-        entries[ncx_name]=re.sub(r'<navPoint\b.*?</navPoint>',replace_ncx_item,ncx,flags=re.S).encode('utf-8')
+        replacements[ncx_name] = re.sub(r'<navPoint\b.*?</navPoint>',replace_ncx_item,ncx,flags=re.S).encode('utf-8')
 
-    temporary=epub.with_suffix(epub.suffix+'.tmp')
-    with zipfile.ZipFile(temporary,'w',compression=zipfile.ZIP_DEFLATED) as archive:
-        for name,data in entries.items(): archive.writestr(name,data)
-    temporary.replace(epub)
+    rewrite_epub(epub, replacements, {'OEBPS/Text/panel-contents.xhtml'})
 
 
 def add_pdf_navigation(pdf: Path, source: Path, title: str, profile: dict[str, object], divider_pages: bool) -> None:
@@ -667,9 +715,57 @@ def request_delay(value: object, default: float = 1.0) -> float:
     if value is None or (isinstance(value, str) and not value.strip()):
         return default
     try:
-        return max(0.0, float(value))
+        parsed = float(value)
+        return max(0.0, parsed) if math.isfinite(parsed) else default
     except (TypeError, ValueError):
         return default
+
+
+def requested_bool(value: object) -> bool:
+    return value if isinstance(value, bool) else str(value).lower() == 'true'
+
+
+@dataclass(frozen=True)
+class ConversionOptions:
+    profile: dict[str, object]
+    delay: float
+    webtoon: bool
+    direction: str
+    output_format: str
+    packaging: str
+    quality: str
+    divider: bool
+    folder_mode: str
+    save_source: bool
+    author: str
+    export_name: str
+    requested_title: str
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> 'ConversionOptions':
+        def choice(name: str, choices: set[str], default: str) -> str:
+            value = str(payload.get(name, default)).lower()
+            if value not in choices:
+                raise ValueError(f'Invalid {name}: {value}')
+            return value
+
+        profile_name = choice('profile', set(PROFILES), 'original')
+        export_name = str(payload.get('export_name') or '').strip()
+        return cls(
+            profile=PROFILES[profile_name],
+            delay=request_delay(payload.get('delay')),
+            webtoon=requested_bool(payload.get('webtoon', False)),
+            direction=choice('direction', {'auto', 'ltr', 'rtl'}, 'auto'),
+            output_format=choice('format', {'auto', 'mobi', 'epub', 'kepub', 'cbz', 'pdf'}, 'auto'),
+            packaging=choice('packaging', {'combined', 'separate'}, 'combined'),
+            quality=choice('quality', {'balanced', 'best', 'compact'}, 'balanced'),
+            divider=requested_bool(payload.get('divider', False)),
+            folder_mode=choice('folder_mode', {'combined', 'separate'}, 'combined'),
+            save_source=requested_bool(payload.get('save_source', False)),
+            author=str(payload.get('author') or '').strip(),
+            export_name=safe_name(export_name) if export_name else '',
+            requested_title=str(payload.get('title') or '').strip(),
+        )
 
 
 def resolve_title(*candidates: object) -> str:
@@ -687,29 +783,54 @@ def update_job(job_id: str, message: str) -> None:
             JOBS[job_id].update({'status': 'working', 'message': message})
 
 
-def prune_jobs() -> None:
+def queue_job(payload: dict[str, object], upload_dir: Path | None) -> str | None:
+    """Reserve a retrievable status slot before starting a conversion."""
     with JOBS_LOCK:
-        while len(JOBS) > MAX_JOBS:
-            JOBS.pop(next(iter(JOBS)), None)
+        while len(JOBS) >= MAX_JOBS:
+            completed = next((job_id for job_id, job in JOBS.items()
+                              if job.get('status') in {'done', 'error'}), None)
+            if completed is None:
+                return None
+            JOBS.pop(completed)
+        job_id = uuid.uuid4().hex
+        JOBS[job_id] = {'status': 'working', 'message': 'Queued…'}
+    try:
+        threading.Thread(target=convert_job, args=(job_id, payload, upload_dir), daemon=True).start()
+    except Exception:
+        with JOBS_LOCK:
+            JOBS.pop(job_id, None)
+        raise
+    return job_id
 
 
 def download_to_path(url: str, target: Path, delay: float) -> Path:
-    if target.exists() and target.stat().st_size > 0:
+    if target.suffix == '.img':
+        for suffix in ('.jpg', '.png', '.gif', '.webp'):
+            existing = target.with_suffix(suffix)
+            if existing.exists() and existing.stat().st_size > 0:
+                return existing
+    if target.suffix != '.img' and target.exists() and target.stat().st_size > 0:
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
+    data = fetch(url, delay=delay)
+    if target.suffix == '.img':
+        extension = image_extension(data[:12])
+        if extension is None:
+            raise RuntimeError(f'Unsupported image data from {url}')
+        target = target.with_suffix('.' + extension)
     temporary = target.with_suffix(target.suffix + '.part')
-    temporary.write_bytes(fetch(url, delay=delay))
+    temporary.write_bytes(data)
     temporary.replace(target)
     return target
 
 
-def save_source_folder(source: Path, title: str) -> tuple[Path, Path] | None:
+def save_source_folder(source: Path, title: str, job_id: str, output_dir: Path) -> tuple[Path, Path] | None:
     if not source.is_dir():
         return None
-    saved = OUTPUT / 'crawled' / safe_name(title)
+    saved = OUTPUT / 'crawled' / safe_name(title) / job_id
     saved.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, saved, dirs_exist_ok=True)
-    zip_path = EXPORTS / safe_name(title) / 'files' / f'{safe_name(title)}.source.zip'
+    shutil.copytree(source, saved)
+    zip_path = output_dir / f'{safe_name(title)}.source.zip'
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(saved.rglob('*'), key=lambda item: natural_sort_key(str(item))):
@@ -718,63 +839,114 @@ def save_source_folder(source: Path, title: str) -> tuple[Path, Path] | None:
     return saved, zip_path
 
 
-def convert_job(job_id: str, payload: dict[str, object]) -> None:
-    temp: Path | None = None
-    upload_dir=Path(str(payload['_upload_dir'])) if payload.get('_upload_dir') else None
-    try:
-        folder_mode=str(payload.get('folder_mode','combined')); save_source=str(payload.get('save_source','false')).lower()=='true' if isinstance(payload.get('save_source'),str) else bool(payload.get('save_source',False))
-        profile=PROFILES.get(str(payload.get('profile')),PROFILES['original']); delay=request_delay(payload.get('delay')); webtoon=str(payload.get('webtoon',False)).lower()=='true' if isinstance(payload.get('webtoon'),str) else bool(payload.get('webtoon',False)); direction=str(payload.get('direction','auto')); requested_format=str(payload.get('format','auto')); packaging=str(payload.get('packaging','combined')); quality=str(payload.get('quality','balanced')); divider=str(payload.get('divider',False)).lower()=='true' if isinstance(payload.get('divider'),str) else bool(payload.get('divider',False)); author=str(payload.get('author') or '').strip(); export_name=safe_name(str(payload.get('export_name') or '').strip()) if str(payload.get('export_name') or '').strip() else ''
-        selected=payload.get('chapters',[]); requested_title=str(payload.get('title') or '').strip(); title='Comic'; source_url=''; temp=Path(tempfile.mkdtemp(prefix='panel-press-')); source=temp/'source'; all_pages=[]; source_archive=None
-        if payload.get('files'):
-            paths=[Path(p) for p in payload['files']]
-            relative_paths=payload.get('relative_paths')
-            relative_paths=relative_paths if isinstance(relative_paths,list) else None
-            metadata=uploaded_metadata(paths,relative_paths)
-            first_name=re.sub(r'^\d{6}-', '', paths[0].name)
-            title=resolve_title(requested_title, metadata.get('title'), Path(first_name).stem)
-            source_url=str(metadata.get('source') or '')
-            if len(paths)==1 and paths[0].suffix.lower()=='.pdf' and find_kcc() and profile.get('kcc'):
-                source=paths[0]
-            else:
-                prepare_local_import(paths,source,relative_paths)
+@dataclass(frozen=True)
+class PreparedSource:
+    path: Path
+    title: str
+    source_url: str
+    page_count: int
+    uploaded: bool
+
+
+def source_images(source: Path) -> list[Path]:
+    extensions = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+    return sorted((path for path in source.rglob('*') if path.is_file() and path.suffix.lower() in extensions),
+                  key=natural_sort_key)
+
+
+def prepare_source(job_id: str, payload: dict[str, object], temporary: Path,
+                   options: ConversionOptions) -> PreparedSource:
+    source = temporary / 'source'
+    if payload.get('files'):
+        paths = [Path(path) for path in payload['files']]
+        relative_paths = payload.get('relative_paths')
+        relative_paths = relative_paths if isinstance(relative_paths, list) else None
+        metadata = uploaded_metadata(paths, relative_paths)
+        first_name = re.sub(r'^\d{6}-', '', paths[0].name)
+        title = resolve_title(options.requested_title, metadata.get('title'), Path(first_name).stem)
+        source_url = str(metadata.get('source') or '')
+        if len(paths) == 1 and paths[0].suffix.lower() == '.pdf' and find_kcc() and options.profile.get('kcc'):
+            source = paths[0]
         else:
-            url=str(payload['url']); source_url=url; locator=payload.get('locator') if isinstance(payload.get('locator'),dict) else None
-            # The browser already scanned the series. Reuse the selected rows
-            # instead of fetching and parsing the entire series a second time.
-            discovered_title=Path(urlparse(url).path.rstrip('/')).name
-            title=resolve_title(requested_title, discovered_title); source.mkdir(parents=True,exist_ok=True)
-            update_job(job_id, f'Preparing {len(selected)} selected chapter(s)…')
-            page_jobs=[]
-            for ci,row in enumerate(selected,1):
-                chapter=Chapter(str(row.get('number','')),str(row.get('title','Chapter')),str(row['url']),str(row.get('chapter_id','')))
-                update_job(job_id, f'Discovering pages for chapter {chapter.number} ({ci}/{len(selected)})…')
-                folder=source/f'{ci:04d}-{safe_name(chapter.title or "chapter-"+chapter.number)}'; folder.mkdir(exist_ok=True)
-                pages=chapter_pages(chapter,delay,locator)
-                page_jobs.extend((ci,chapter.number,page,folder/f'{pi:04d}.{guess_extension(page)}') for pi,page in enumerate(pages,1))
-            total_pages=len(page_jobs); completed=0
-            update_job(job_id, f'Downloading 0/{total_pages} pages with {DOWNLOAD_WORKERS} workers…')
-            with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
-                futures=[pool.submit(download_to_path,page,target,delay) for _,_,page,target in page_jobs]
-                for future in as_completed(futures):
-                    future.result(); completed+=1
-                    if completed==total_pages or completed%5==0:
-                        update_job(job_id, f'Downloading {completed}/{total_pages} pages…')
-            all_pages=sorted((p for p in source.rglob('*') if p.is_file() and p.suffix.lower() in {'.jpg','.jpeg','.png','.webp','.gif'}),key=natural_sort_key)
-            if not all_pages: raise RuntimeError('No pages were found in the selected chapters.')
-        if not all_pages:
-            if source.is_dir():
-                all_pages=sorted((p for p in source.rglob('*') if p.is_file() and p.suffix.lower() in {'.jpg','.jpeg','.png','.webp','.gif'}),key=natural_sort_key)
-            elif source.is_file():
-                all_pages=[source]
-        if save_source:
-            saved_source=save_source_folder(source,title)
+            prepare_local_import(paths, source, relative_paths)
+        page_count = 1 if source.is_file() else len(source_images(source))
+        return PreparedSource(source, title, source_url, page_count, True)
+
+    url = str(payload['url'])
+    locator = payload.get('locator') if isinstance(payload.get('locator'), dict) else None
+    selected = payload.get('chapters', [])
+    title = resolve_title(options.requested_title, Path(urlparse(url).path.rstrip('/')).name)
+    source.mkdir(parents=True, exist_ok=True)
+    update_job(job_id, f'Preparing {len(selected)} selected chapter(s)…')
+    page_jobs: list[tuple[str, Path]] = []
+    for index, row in enumerate(selected, 1):
+        chapter = Chapter(str(row.get('number', '')), str(row.get('title', 'Chapter')),
+                          str(row['url']), str(row.get('chapter_id', '')))
+        update_job(job_id, f'Discovering pages for chapter {chapter.number} ({index}/{len(selected)})…')
+        folder = source / f'{index:04d}-{safe_name(chapter.title or "chapter-" + chapter.number)}'
+        folder.mkdir(exist_ok=True)
+        for page_index, page in enumerate(chapter_pages(chapter, options.delay, locator), 1):
+            page_jobs.append((page, folder / f'{page_index:04d}.{guess_extension(page)}'))
+    total_pages = len(page_jobs)
+    update_job(job_id, f'Downloading 0/{total_pages} pages with {DOWNLOAD_WORKERS} workers…')
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+        futures = [pool.submit(download_to_path, page, target, options.delay) for page, target in page_jobs]
+        for completed, future in enumerate(as_completed(futures), 1):
+            future.result()
+            if completed == total_pages or completed % 5 == 0:
+                update_job(job_id, f'Downloading {completed}/{total_pages} pages…')
+    page_count = len(source_images(source))
+    if not page_count:
+        raise RuntimeError('No pages were found in the selected chapters.')
+    return PreparedSource(source, title, url, page_count, False)
+
+
+def build_fallback(source: Path, output_dir: Path, title: str, direction: str,
+                   options: ConversionOptions) -> tuple[Path, int]:
+    if not source.is_dir():
+        raise RuntimeError('KCC is required to convert this PDF. Install KCC or pdftoppm.')
+    if options.output_format in {'mobi', 'kepub'}:
+        raise RuntimeError(f'{options.output_format.upper()} output requires KCC.')
+    pages = source_images(source)
+    if not pages:
+        raise RuntimeError('No image pages are available for conversion.')
+    flat = output_dir / 'pages'
+    flat.mkdir(parents=True, exist_ok=True)
+    for index, page in enumerate(pages, 1):
+        shutil.copyfile(page, flat / f'{index:04d}{page.suffix.lower()}')
+    if options.output_format == 'auto':
+        extension = 'epub' if options.profile['format'] in {'mobi', 'epub'} else 'cbz'
+    else:
+        extension = options.output_format
+    output = output_dir / f'{safe_name(options.export_name or title)}.{extension}'
+    if extension == 'epub':
+        make_epub(flat, title, output, tuple(options.profile['size']), direction)
+    elif extension == 'pdf':
+        make_pdf(flat, output)
+    elif extension == 'cbz':
+        make_cbz(flat, title, output)
+    else:
+        raise ValueError(f'Unsupported output format: {extension}')
+    return output, len(pages)
+
+
+def convert_job(job_id: str, payload: dict[str, object], upload_dir: Path | None = None) -> None:
+    temp: Path | None = None
+    try:
+        options = ConversionOptions.from_payload(payload)
+        temp = Path(tempfile.mkdtemp(prefix='panel-press-'))
+        prepared = prepare_source(job_id, payload, temp, options)
+        source, title = prepared.path, prepared.title
+        _, output_dir, chapter_output_dir = export_paths(title, job_id)
+        source_archive = None
+        if options.save_source:
+            saved_source=save_source_folder(source,title,job_id,output_dir)
             if saved_source:
                 source_archive=saved_source[1]
-                update_job(job_id, f'Saved source images to output/crawled/{saved_source[0].name}/…')
-        direction=resolve_direction(direction, source_url, webtoon)
+                update_job(job_id, f'Saved source images to output/crawled/{safe_name(title)}/{job_id}/…')
+        direction=resolve_direction(options.direction, prepared.source_url, options.webtoon)
         kcc_input=kcc_source_root(source)
-        export_root,output_dir,chapter_output_dir=export_paths(title)
-        separate_folders=folder_mode=='separate' and not payload.get('files') and kcc_input.is_dir()
+        separate_folders=options.folder_mode=='separate' and not prepared.uploaded and kcc_input.is_dir()
         if separate_folders:
             chapter_output_dir.mkdir(parents=True,exist_ok=True)
             for chapter_folder in chapter_directories(kcc_input):
@@ -782,36 +954,34 @@ def convert_job(job_id: str, payload: dict[str, object]) -> None:
                 if destination.exists(): shutil.rmtree(destination)
                 shutil.copytree(chapter_folder,destination)
         output_dir.mkdir(parents=True,exist_ok=True)
-        pdf_output=requested_format.lower()=='pdf'
-        navigation_pages=divider and packaging=='combined' and not pdf_output
-        update_job(job_id, f'Packaging {len(all_pages)} pages with {profile["label"]}…')
-        kcc_files=run_kcc(kcc_input,title,profile,output_dir,webtoon,direction,requested_format,packaging,quality,navigation_pages,author)
+        navigation_pages = options.divider and options.packaging == 'combined' and options.output_format != 'pdf'
+        update_job(job_id, f'Packaging {prepared.page_count} pages with {options.profile["label"]}…')
+        kcc_files = run_kcc(kcc_input, title, options.profile, output_dir, options.webtoon,
+                            direction, options.output_format, options.packaging, options.quality,
+                            navigation_pages, options.author)
         if kcc_files:
-            kcc_files=rename_outputs(kcc_files,output_dir,title,kcc_input,packaging,export_name or title)
+            kcc_files = rename_outputs(kcc_files, output_dir, title, kcc_input,
+                                       options.packaging, options.export_name or title)
             for generated in kcc_files:
                 normalize_epub_reading_order(generated, direction)
-            if packaging=='combined' and requested_format.lower() in {'auto','epub','kepub'}:
+            if options.packaging == 'combined' and options.output_format in {'auto', 'epub', 'kepub'}:
                 for generated in kcc_files: update_epub_navigation(generated,kcc_input)
-            if packaging=='combined':
+            if options.packaging == 'combined':
                 for generated in kcc_files:
-                    if generated.suffix.lower()=='.pdf': add_pdf_navigation(generated,kcc_input,title,profile,False)
-            files=['/downloads/'+p.name for p in kcc_files]
-            message=f'KCC built {kcc_files[0].name} using the {profile["label"]} profile ({direction.upper()} reading).'
+                    if generated.suffix.lower()=='.pdf':
+                        add_pdf_navigation(generated,kcc_input,title,options.profile,False)
+            files = [download_url(path) for path in kcc_files]
+            message = f'KCC built {kcc_files[0].name} using the {options.profile["label"]} profile ({direction.upper()} reading).'
         else:
-            pages=sorted((p for p in kcc_input.rglob('*') if p.suffix.lower() in {'.jpg','.jpeg','.png','.webp','.gif'}),key=natural_sort_key)
-            flat=output_dir/'pages'; flat.mkdir(exist_ok=True)
-            for i,p in enumerate(pages,1): shutil.copyfile(p,flat/f'{i:04d}{p.suffix.lower()}')
-            export_prefix=export_name or title
-            ext='pdf' if requested_format=='pdf' else ('epub' if requested_format in {'auto','epub','kepub'} and str(profile['format'])=='epub' else 'cbz'); out=output_dir/f'{safe_name(export_prefix)}.{ext}'
-            if ext=='epub': make_epub(flat,title,out,tuple(profile['size']),direction)
-            elif ext=='pdf': make_pdf(flat,out)
-            else: make_cbz(flat,title,out)
-            files=['/downloads/'+out.name]; message=f'Built {out.name} with {len(pages)} pages using the built-in fallback. Install KCC to enable native MOBI/KEPUB output.'
+            output, page_count = build_fallback(kcc_input, output_dir, title, direction, options)
+            files = [download_url(output)]
+            message = (f'Built {output.name} with {page_count} pages using the built-in fallback. '
+                       'Install KCC to enable native MOBI/KEPUB output.')
         if source_archive:
-            files.append('/downloads/'+source_archive.name)
-            message += f' Source images saved under output/crawled/{safe_name(title)}/.'
+            files.append(download_url(source_archive))
+            message += f' Source images saved under output/crawled/{safe_name(title)}/{job_id}/.'
         if separate_folders:
-            message += f' Separate chapter folders were created under output/exports/{safe_name(title)}/chapters/.'
+            message += f' Separate chapter folders were created under output/exports/{safe_name(title)}/{job_id}/chapters/.'
         with JOBS_LOCK: JOBS[job_id]={'status':'done','message':message,'files':files}
     except Exception as exc:
         with JOBS_LOCK: JOBS[job_id]={'status':'error','message':str(exc)}
@@ -828,15 +998,75 @@ def _has_pillow() -> bool:
         return False
 
 
-def multipart_parts(request_file: Path):
-    """Yield (field_name, filename, payload_bytes) for a stored multipart body."""
-    with request_file.open('rb') as handle:
-        message=BytesParser(policy=email_policy.default).parse(handle)
-    for part in message.iter_parts():
-        name=part.get_param('name', header='content-disposition')
-        filename=part.get_filename()
-        data=part.get_payload(decode=True) or b''
-        yield name, filename, data
+def read_multipart_upload(stream, length: int, content_type: str, upload_dir: Path,
+                          fields: dict[str, str]) -> list[str]:
+    """Stream multipart file parts to disk with bounded memory use."""
+    content_header = Message()
+    content_header['Content-Type'] = content_type
+    boundary = content_header.get_boundary()
+    if not boundary or len(boundary) > 70 or not boundary.isascii() or any(ord(char) < 32 for char in boundary):
+        raise ValueError('Invalid multipart boundary.')
+    delimiter = b'--' + boundary.encode('ascii')
+    remaining = length
+
+    def read_line(limit: int = 65536) -> bytes:
+        nonlocal remaining
+        if remaining <= 0:
+            raise ValueError('Incomplete upload body.')
+        line = stream.readline(min(limit, remaining))
+        if not line:
+            raise ValueError('Incomplete upload body.')
+        remaining -= len(line)
+        return line
+
+    if read_line() != delimiter + b'\r\n':
+        raise ValueError('Invalid multipart opening boundary.')
+    paths = []
+    while True:
+        header_lines = []
+        header_size = 0
+        while True:
+            line = read_line(8192)
+            header_size += len(line)
+            if header_size > 32768 or (not line.endswith(b'\n') and len(line) >= 8192):
+                raise ValueError('Multipart headers are too large.')
+            if line == b'\r\n':
+                break
+            header_lines.append(line)
+        part = BytesParser(policy=email_policy.default).parsebytes(b''.join(header_lines) + b'\r\n')
+        name = part.get_param('name', header='content-disposition')
+        filename = part.get_filename()
+        target = None
+        if name == 'files' and filename is not None:
+            target = upload_dir / f'{len(paths)+1:06d}-{safe_name(Path(filename).name)}'
+            paths.append(str(target))
+        output = target.open('wb') if target else (io.BytesIO() if name in fields else None)
+
+        def write(data: bytes) -> None:
+            if output is not None:
+                if target is None and output.tell() + len(data) > MAX_FIELD_BYTES:
+                    raise ValueError('Multipart field is too large.')
+                output.write(data)
+
+        try:
+            pending = b''
+            while True:
+                line = read_line()
+                if line in (delimiter + b'\r\n', delimiter + b'--\r\n', delimiter + b'--'):
+                    if not pending.endswith(b'\r\n'):
+                        raise ValueError('Malformed multipart boundary.')
+                    write(pending[:-2])
+                    final = line != delimiter + b'\r\n'
+                    break
+                write(pending)
+                pending = line
+            if target is None and name in fields:
+                fields[name] = output.getvalue().decode('utf-8', 'replace')
+        finally:
+            if output is not None:
+                output.close()
+        if final:
+            return paths
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -850,55 +1080,83 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({'kcc': find_kcc() is not None, 'kindlegen': shutil.which('kindlegen') is not None, 'pillow': _has_pillow()}); return
         if self.path.startswith('/api/v1/conversions/') or self.path.startswith('/api/jobs/'):
             with JOBS_LOCK: self.send_json(JOBS.get(self.path.rsplit('/',1)[-1],{'status':'error','message':'Unknown job'})); return
-        if self.path.startswith('/downloads/'):
-            path=(OUTPUT/self.path.split('/')[-1]).resolve(); candidates=list(OUTPUT.rglob(path.name))
-            if candidates and candidates[0].is_file(): path=candidates[0]; raw=path.read_bytes(); self.send_response(200); self.send_header('Content-Type',mimetypes.guess_type(str(path))[0] or 'application/octet-stream'); self.send_header('Content-Disposition',f'attachment; filename="{path.name}"'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+        if urlsplit(self.path).path.startswith('/downloads/'):
+            path = downloadable_path(urlsplit(self.path).path)
+            if path is not None:
+                self.send_response(200)
+                self.send_header('Content-Type', mimetypes.guess_type(str(path))[0] or 'application/octet-stream')
+                self.send_header('Content-Disposition', f"attachment; filename*=UTF-8''{quote(path.name)}")
+                self.send_header('Content-Length', str(path.stat().st_size))
+                self.end_headers()
+                with path.open('rb') as source:
+                    shutil.copyfileobj(source, self.wfile, length=1024 * 1024)
+                return
         self.send_error(404)
-    def stream_body(self, length, content_type, upload_dir):
-        """Write synthesized headers plus the request body to disk incrementally."""
-        request_file=upload_dir/'.request-body'
-        with request_file.open('wb') as handle:
-            handle.write(b'Content-Type: '+content_type.encode('latin-1')+b'\r\nMIME-Version: 1.0\r\n\r\n')
-            remaining=length
-            while remaining > 0:
-                chunk=self.rfile.read(min(65536, remaining))
-                if not chunk: break
-                handle.write(chunk); remaining-=len(chunk)
-        return request_file
-
     def do_POST(self):
-        length=int(self.headers.get('Content-Length','0')); content_type=self.headers.get('Content-Type','')
-        if content_type.startswith('multipart/form-data'):
-            upload_dir=Path(tempfile.mkdtemp(prefix='panel-upload-')); paths=[]
-            fields={'profile':'original','delay':'1','webtoon':'false','direction':'auto','title':'Comic','author':'','export_name':'','relative_paths':'[]','format':'auto','packaging':'combined','quality':'balanced','divider':'false','chapter_href_pattern':'','chapter_number_pattern':'','page_list_suffix':'','save_source':'false'}
-            request_file=self.stream_body(length, content_type, upload_dir)
-            file_index=0
-            for name, filename, data in multipart_parts(request_file):
-                if filename is not None and name == 'files':
-                    file_index+=1
-                    target=upload_dir/f'{file_index:06d}-{safe_name(Path(filename).name)}'
-                    target.write_bytes(data); paths.append(str(target))
-                elif name in fields:
-                    fields[name]=data.decode('utf-8','replace')
-            payload={**fields,'files':paths,'webtoon':fields['webtoon']=='true','locator':{key:fields[key] for key in ('chapter_href_pattern','chapter_number_pattern','page_list_suffix') if fields[key].strip()},'_upload_dir':str(upload_dir)}
-            try: payload['relative_paths']=json.loads(fields['relative_paths'])
-            except json.JSONDecodeError: payload['relative_paths']=[]
-        else:
-            raw=self.rfile.read(length) if length else b''
-            payload=json.loads(raw or b'{}')
+        upload_dir = None
         try:
+            origin = self.headers.get('Origin')
+            if origin and urlparse(origin).netloc != self.headers.get('Host'):
+                raise ValueError('Cross-origin requests are not accepted.')
+            if self.path not in {'/api/v1/scans', '/api/scan', '/api/v1/conversions', '/api/convert'}:
+                self.send_error(404)
+                return
+            length = int(self.headers.get('Content-Length', '0'))
+            content_type = self.headers.get('Content-Type', '')
+            multipart = content_type.lower().startswith('multipart/form-data')
+            limit = MAX_UPLOAD_BYTES if multipart else MAX_JSON_BYTES
+            if length <= 0 or length > limit:
+                self.send_json({'error': f'Request body must be between 1 and {limit} bytes.'}, 413)
+                return
+            if multipart:
+                if self.path not in {'/api/v1/conversions', '/api/convert'}:
+                    raise ValueError('Uploads are only accepted for conversions.')
+                upload_dir = Path(tempfile.mkdtemp(prefix='panel-upload-'))
+                fields = {'profile':'original','delay':'1','webtoon':'false','direction':'auto','title':'','author':'','export_name':'','relative_paths':'[]','format':'auto','packaging':'combined','quality':'balanced','divider':'false','folder_mode':'combined','chapter_href_pattern':'','chapter_number_pattern':'','page_list_suffix':'','save_source':'false'}
+                paths = read_multipart_upload(self.rfile, length, content_type, upload_dir, fields)
+                relative_paths = json.loads(fields['relative_paths'])
+                if not isinstance(relative_paths, list) or not all(isinstance(path, str) for path in relative_paths):
+                    raise ValueError('relative_paths must be a list of strings.')
+                if not paths:
+                    raise ValueError('Upload at least one image or PDF.')
+                payload = {**fields, 'files': paths, 'relative_paths': relative_paths,
+                           'webtoon': fields['webtoon'] == 'true',
+                           'locator': {key: fields[key] for key in ('chapter_href_pattern','chapter_number_pattern','page_list_suffix') if fields[key].strip()}}
+            else:
+                if not content_type.lower().startswith('application/json'):
+                    raise ValueError('Expected an application/json request.')
+                payload = json.loads(self.rfile.read(length))
+                if not isinstance(payload, dict):
+                    raise ValueError('Expected a JSON object.')
+                if 'files' in payload or '_upload_dir' in payload:
+                    raise ValueError('Local files must be sent as an upload.')
+                if not isinstance(payload.get('url'), str) or not payload['url'].strip():
+                    raise ValueError('A series URL is required.')
+                if self.path in {'/api/v1/conversions', '/api/convert'}:
+                    chapters = payload.get('chapters')
+                    if not isinstance(chapters, list) or not chapters or not all(
+                        isinstance(chapter, dict) and isinstance(chapter.get('url'), str)
+                        for chapter in chapters
+                    ):
+                        raise ValueError('Select at least one chapter.')
             if self.path in {'/api/v1/scans','/api/scan'}:
                 result = scan_preview(str(payload['url']), request_delay(payload.get('delay')),
                                       payload.get('locator') if isinstance(payload.get('locator'), dict) else None)
                 self.send_json(result)
                 return
             if self.path in {'/api/v1/conversions','/api/convert'}:
-                job_id=uuid.uuid4().hex; with_lock={'status':'working','message':'Queued…'}
-                with JOBS_LOCK: JOBS[job_id]=with_lock
-                prune_jobs()
-                threading.Thread(target=convert_job,args=(job_id,payload),daemon=True).start(); self.send_json({'job_id':job_id}); return
-            self.send_error(404)
-        except Exception as exc: self.send_json({'error':str(exc)},400)
+                ConversionOptions.from_payload(payload)
+                job_id = queue_job(payload, upload_dir)
+                if job_id is None:
+                    self.send_json({'error': 'Too many conversions are running. Try again when one finishes.'}, 429)
+                    return
+                upload_dir = None
+                self.send_json({'job_id':job_id}); return
+        except (ValueError, KeyError, json.JSONDecodeError, RuntimeError) as exc:
+            self.send_json({'error':str(exc)},400)
+        finally:
+            if upload_dir is not None:
+                shutil.rmtree(upload_dir, ignore_errors=True)
     def log_message(self, *_): pass
 
 

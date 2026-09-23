@@ -71,12 +71,14 @@ def fetch(url: str, *, retries: int = 3, delay: float = 0.0) -> bytes:
         time.sleep(delay)
     request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,image/*,*/*;q=0.8"})
     last_error: Exception | None = None
-    for attempt in range(retries):
+    for attempt in range(max(1, retries)):
         try:
             with urlopen(request, timeout=45) as response:
                 return response.read()
         except HTTPError as exc:
             last_error = exc
+            if exc.code not in {429, 500, 502, 503, 504} or attempt + 1 >= max(1, retries):
+                break
             if exc.code == 429:
                 retry_after = exc.headers.get("Retry-After") if exc.headers else None
                 try:
@@ -84,11 +86,11 @@ def fetch(url: str, *, retries: int = 3, delay: float = 0.0) -> bytes:
                 except ValueError:
                     wait = 10.0 * (attempt + 1)
                 time.sleep(wait)
-            elif attempt + 1 < retries:
+            else:
                 time.sleep(2 ** attempt)
         except (URLError, TimeoutError) as exc:
             last_error = exc
-            if attempt + 1 < retries:
+            if attempt + 1 < max(1, retries):
                 time.sleep(2 ** attempt)
     raise RuntimeError(f"Unable to fetch {url}: {last_error}")
 
@@ -186,11 +188,40 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def image_extension(header: bytes) -> str | None:
+    """Recognize supported image formats when a URL lacks an extension."""
+    if header.startswith(b'\xff\xd8\xff'):
+        return 'jpg'
+    if header.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'png'
+    if header.startswith((b'GIF87a', b'GIF89a')):
+        return 'gif'
+    if header[:4] == b'RIFF' and header[8:12] == b'WEBP':
+        return 'webp'
+    return None
+
+
 def download_page(url: str, target: Path, delay: float, retries: int) -> None:
-    if target.exists() and target.stat().st_size > 0:
+    if target.suffix == '.img':
+        for suffix in ('.jpg', '.png', '.gif', '.webp'):
+            existing = target.with_suffix(suffix)
+            if existing.exists() and existing.stat().st_size > 0:
+                return
+    if target.suffix == '.img' and target.exists() and target.stat().st_size > 0:
+        with target.open('rb') as source:
+            extension = image_extension(source.read(12))
+        if extension:
+            target.replace(target.with_suffix('.' + extension))
+            return
+    if target.suffix != '.img' and target.exists() and target.stat().st_size > 0:
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     data = fetch(url, delay=delay, retries=retries)
+    if target.suffix == '.img':
+        extension = image_extension(data[:12])
+        if extension is None:
+            raise RuntimeError(f'Unsupported image data from {url}')
+        target = target.with_suffix('.' + extension)
     temporary = target.with_suffix(target.suffix + ".part")
     temporary.write_bytes(data)
     temporary.replace(target)
@@ -209,8 +240,13 @@ def crawl(series_url: str, output: Path, delay: float, workers: int, chapter_wor
         if existing_meta.exists():
             try:
                 cached = json.loads(existing_meta.read_text(encoding="utf-8"))
-                present = [p for p in folder.iterdir() if p.name != "chapter.json" and not p.name.endswith(".part")]
-                if len(present) >= int(cached.get("page_count", -1)) > 0:
+                present = {int(p.stem) for p in folder.iterdir()
+                           if p.is_file() and re.fullmatch(r"[0-9]{4}", p.stem)
+                           and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+                           and p.stat().st_size > 0}
+                page_count = int(cached.get("page_count", -1))
+                if (not metadata_only and cached.get("url") == chapter.url
+                        and page_count > 0 and present.issuperset(range(1, page_count + 1))):
                     print(f"[{index}/{len(chapters)}] Chapter {chapter.number}: already complete", flush=True)
                     return cached, []
             except (OSError, ValueError, TypeError):
